@@ -136,11 +136,7 @@ def get_stats():
         "total": total, "wins": wins, "losses": losses,
         "winrate": winrate, "total_pnl": round(total_pnl, 2)
     })
-@app.route("/price", methods=["POST"])
-def receive_price():
-    data = request.json
-    print(f"Prix MT4 reçu: {data}")
-    return jsonify({"success": True, "received": data})
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
