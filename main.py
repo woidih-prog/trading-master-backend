@@ -123,4 +123,15 @@ def get_stats():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    
+    import threading, requests, time
+    def keep_alive():
+        while True:
+            time.sleep(840)
+            try:
+                requests.get("https://trading-master-backend.onrender.com/")
+            except:
+                pass
+    threading.Thread(target=keep_alive, daemon=True).start()
+    
     app.run(host="0.0.0.0", port=port)
