@@ -13,6 +13,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_KEY")
 DB_PATH          = "/tmp/journal.db"
 mt4_prices       = {}
+mt4_candles      = {}
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -67,7 +68,21 @@ def get_price(symbol):
     if price:
         return jsonify(price)
     return jsonify({"error": "Prix non disponible"}), 404
+@app.route("/candles", methods=["POST"])
+def receive_candles():
+    data = request.json
+    symbol = data.get("symbol","").upper().replace("/","")
+    mt4_candles[symbol] = data
+    print(f"Bougies MT4 reçues: {symbol} — {len(data.get('candles',[]))} bougies")
+    return jsonify({"success": True})
 
+@app.route("/candles/<symbol>", methods=["GET"])
+def get_candles(symbol):
+    key = symbol.upper().replace("/","")
+    candles = mt4_candles.get(key)
+    if candles:
+        return jsonify(candles)
+    return jsonify({"error": "Bougies non disponibles"}), 404
 @app.route("/journal", methods=["POST"])
 def add_trade():
     data = request.json
