@@ -4,7 +4,9 @@ import requests
 import os
 import sqlite3
 from datetime import datetime
-
+import pytz
+import threading
+import time
 app = Flask(__name__)
 CORS(app, origins="*")
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
@@ -169,6 +171,49 @@ def get_screenshot(symbol):
     if shot:
         return jsonify(shot)
     return jsonify({"error": "Screenshot non disponible"}), 404
+    import threading
+from datetime import datetime
+import pytz
+
+def scheduler_job():
+    paris_tz = pytz.timezone('Europe/Paris')
+    analyzed_today = {'london': None, 'ny': None}
+    
+    while True:
+        try:
+            now = datetime.now(paris_tz)
+            h, m = now.hour, now.minute
+            day = now.weekday()  # 0=lundi, 6=dimanche
+            today = now.strftime('%Y-%m-%d')
+            
+            # Pas le weekend
+            if day < 5:
+                # London Open 7h00
+                if h == 7 and m == 0 and analyzed_today['london'] != today:
+                    analyzed_today['london'] = today
+                    trigger_analysis('London Open')
+                
+                # NY Open 13h30
+                if h == 13 and m == 30 and analyzed_today['ny'] != today:
+                    analyzed_today['ny'] = today
+                    trigger_analysis('NY Open')
+        except Exception as e:
+            print(f"Scheduler error: {e}")
+        
+        time.sleep(30)
+
+def trigger_analysis(session):
+    try:
+        msg = f"⏰ <b>Trading Master V5 — {session}</b>\nAnalyse automatique déclenchée. Vérifiez l'app pour les signaux."
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
+        )
+        print(f"Scheduler: {session} déclenché")
+    except Exception as e:
+        print(f"Trigger error: {e}")
+
+threading.Thread(target=scheduler_job, daemon=True).start()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     
