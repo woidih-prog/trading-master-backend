@@ -135,7 +135,40 @@ def get_stats():
     done = c.fetchone()[0]
     winrate = round(wins/done*100) if done>0 else 0
     return jsonify({"total":total,"wins":wins,"losses":losses,"winrate":winrate,"total_pnl":round(total_pnl,2)})
+mt4_daily      = {}
+mt4_screenshots = {}
 
+@app.route("/daily", methods=["POST"])
+def receive_daily():
+    data = request.json
+    symbol = data.get("symbol","").upper().replace("/","")
+    mt4_daily[symbol] = data
+    print(f"Daily reçu: {symbol} — {len(data.get('candles',[]))} bougies")
+    return jsonify({"success": True})
+
+@app.route("/daily/<symbol>", methods=["GET"])
+def get_daily(symbol):
+    key = symbol.upper().replace("/","")
+    daily = mt4_daily.get(key)
+    if daily:
+        return jsonify(daily)
+    return jsonify({"error": "Daily non disponible"}), 404
+
+@app.route("/screenshot", methods=["POST"])
+def receive_screenshot():
+    data = request.json
+    symbol = data.get("symbol","").upper().replace("/","")
+    mt4_screenshots[symbol] = data
+    print(f"Screenshot reçu: {symbol}")
+    return jsonify({"success": True})
+
+@app.route("/screenshot/<symbol>", methods=["GET"])
+def get_screenshot(symbol):
+    key = symbol.upper().replace("/","")
+    shot = mt4_screenshots.get(key)
+    if shot:
+        return jsonify(shot)
+    return jsonify({"error": "Screenshot non disponible"}), 404
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     
