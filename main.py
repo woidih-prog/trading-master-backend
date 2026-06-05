@@ -7,7 +7,7 @@ from datetime import datetime
 
 app = Flask(__name__)
 CORS(app, origins="*")
-
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_KEY")
