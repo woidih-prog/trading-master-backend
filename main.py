@@ -7,15 +7,21 @@ from datetime import datetime
 import pytz
 import threading
 import time
+
 app = Flask(__name__)
 CORS(app, origins="*")
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_KEY")
 DB_PATH          = "/tmp/journal.db"
-mt4_prices       = {}
-mt4_candles      = {}
+
+mt4_prices      = {}
+mt4_candles     = {}
+mt4_m15         = {}
+mt4_daily       = {}
+mt4_screenshots = {}
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -55,12 +61,13 @@ def anthropic():
     )
     return jsonify(r.json())
 
+# ── PRIX ──────────────────────────────────────────────────────
 @app.route("/price", methods=["POST"])
 def receive_price():
     data = request.json
     symbol = data.get("symbol","").upper().replace("/","")
     mt4_prices[symbol] = data
-    print(f"Prix MT4 reçu: {data}")
+    print(f"Prix MT4 recu: {data}")
     return jsonify({"success": True})
 
 @app.route("/price/<symbol>", methods=["GET"])
@@ -70,12 +77,14 @@ def get_price(symbol):
     if price:
         return jsonify(price)
     return jsonify({"error": "Prix non disponible"}), 404
+
+# ── BOUGIES H1 ────────────────────────────────────────────────
 @app.route("/candles", methods=["POST"])
 def receive_candles():
     data = request.json
     symbol = data.get("symbol","").upper().replace("/","")
     mt4_candles[symbol] = data
-    print(f"Bougies MT4 reçues: {symbol} — {len(data.get('candles',[]))} bougies")
+    print(f"Bougies H1 recues: {symbol} — {len(data.get('candles',[]))} bougies")
     return jsonify({"success": True})
 
 @app.route("/candles/<symbol>", methods=["GET"])
@@ -85,6 +94,59 @@ def get_candles(symbol):
     if candles:
         return jsonify(candles)
     return jsonify({"error": "Bougies non disponibles"}), 404
+
+# ── BOUGIES M15 ───────────────────────────────────────────────
+@app.route("/m15", methods=["POST"])
+def receive_m15():
+    data = request.json
+    symbol = data.get("symbol","").upper().replace("/","")
+    mt4_m15[symbol] = data
+    print(f"Bougies M15 recues: {symbol} — {len(data.get('candles',[]))} bougies")
+    return jsonify({"success": True})
+
+@app.route("/m15/<symbol>", methods=["GET"])
+def get_m15(symbol):
+    key = symbol.upper().replace("/","")
+    candles = mt4_m15.get(key)
+    if candles:
+        return jsonify(candles)
+    return jsonify({"error": "Bougies M15 non disponibles"}), 404
+
+# ── BOUGIES DAILY ─────────────────────────────────────────────
+@app.route("/daily", methods=["POST"])
+def receive_daily():
+    data = request.json
+    symbol = data.get("symbol","").upper().replace("/","")
+    mt4_daily[symbol] = data
+    print(f"Daily recu: {symbol} — {len(data.get('candles',[]))} bougies")
+    return jsonify({"success": True})
+
+@app.route("/daily/<symbol>", methods=["GET"])
+def get_daily(symbol):
+    key = symbol.upper().replace("/","")
+    daily = mt4_daily.get(key)
+    if daily:
+        return jsonify(daily)
+    return jsonify({"error": "Daily non disponible"}), 404
+
+# ── SCREENSHOT ────────────────────────────────────────────────
+@app.route("/screenshot", methods=["POST"])
+def receive_screenshot():
+    data = request.json
+    symbol = data.get("symbol","").upper().replace("/","")
+    mt4_screenshots[symbol] = data
+    print(f"Screenshot recu: {symbol}")
+    return jsonify({"success": True})
+
+@app.route("/screenshot/<symbol>", methods=["GET"])
+def get_screenshot(symbol):
+    key = symbol.upper().replace("/","")
+    shot = mt4_screenshots.get(key)
+    if shot:
+        return jsonify(shot)
+    return jsonify({"error": "Screenshot non disponible"}), 404
+
+# ── JOURNAL ───────────────────────────────────────────────────
 @app.route("/journal", methods=["POST"])
 def add_trade():
     data = request.json
@@ -136,88 +198,46 @@ def get_stats():
     c.execute("SELECT COUNT(*) FROM journal WHERE resultat IS NOT NULL AND resultat!=''")
     done = c.fetchone()[0]
     winrate = round(wins/done*100) if done>0 else 0
+    conn.close()
     return jsonify({"total":total,"wins":wins,"losses":losses,"winrate":winrate,"total_pnl":round(total_pnl,2)})
-mt4_daily      = {}
-mt4_screenshots = {}
 
-@app.route("/daily", methods=["POST"])
-def receive_daily():
-    data = request.json
-    symbol = data.get("symbol","").upper().replace("/","")
-    mt4_daily[symbol] = data
-    print(f"Daily reçu: {symbol} — {len(data.get('candles',[]))} bougies")
-    return jsonify({"success": True})
-
-@app.route("/daily/<symbol>", methods=["GET"])
-def get_daily(symbol):
-    key = symbol.upper().replace("/","")
-    daily = mt4_daily.get(key)
-    if daily:
-        return jsonify(daily)
-    return jsonify({"error": "Daily non disponible"}), 404
-
-@app.route("/screenshot", methods=["POST"])
-def receive_screenshot():
-    data = request.json
-    symbol = data.get("symbol","").upper().replace("/","")
-    mt4_screenshots[symbol] = data
-    print(f"Screenshot reçu: {symbol}")
-    return jsonify({"success": True})
-
-@app.route("/screenshot/<symbol>", methods=["GET"])
-def get_screenshot(symbol):
-    key = symbol.upper().replace("/","")
-    shot = mt4_screenshots.get(key)
-    if shot:
-        return jsonify(shot)
-    return jsonify({"error": "Screenshot non disponible"}), 404
-    import threading
-from datetime import datetime
-import pytz
-
+# ── SCHEDULER ─────────────────────────────────────────────────
 def scheduler_job():
     paris_tz = pytz.timezone('Europe/Paris')
     analyzed_today = {'london': None, 'ny': None}
-    
     while True:
         try:
             now = datetime.now(paris_tz)
             h, m = now.hour, now.minute
-            day = now.weekday()  # 0=lundi, 6=dimanche
+            day = now.weekday()
             today = now.strftime('%Y-%m-%d')
-            
-            # Pas le weekend
             if day < 5:
-                # London Open 7h00
                 if h == 7 and m == 0 and analyzed_today['london'] != today:
                     analyzed_today['london'] = today
                     trigger_analysis('London Open')
-                
-                # NY Open 13h30
                 if h == 13 and m == 30 and analyzed_today['ny'] != today:
                     analyzed_today['ny'] = today
                     trigger_analysis('NY Open')
         except Exception as e:
             print(f"Scheduler error: {e}")
-        
         time.sleep(30)
 
 def trigger_analysis(session):
     try:
-        msg = f"⏰ <b>Trading Master V5 — {session}</b>\nAnalyse automatique déclenchée. Vérifiez l'app pour les signaux."
+        msg = f"Trading Master V5 — {session}\nAnalyse automatique declenchee."
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
         )
-        print(f"Scheduler: {session} déclenché")
+        print(f"Scheduler: {session} declenche")
     except Exception as e:
         print(f"Trigger error: {e}")
 
 threading.Thread(target=scheduler_job, daemon=True).start()
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    
-    import threading, requests, time
+
     def keep_alive():
         while True:
             time.sleep(840)
@@ -226,5 +246,5 @@ if __name__ == "__main__":
             except:
                 pass
     threading.Thread(target=keep_alive, daemon=True).start()
-    
+
     app.run(host="0.0.0.0", port=port)
