@@ -228,7 +228,9 @@ def anthropic():
 # ── PRIX ──────────────────────────────────────────────────────
 @app.route("/price", methods=["POST"])
 def receive_price():
-    data = request.json
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"error": "JSON invalide"}), 400
     symbol = data.get("symbol","").upper().replace("/","")
     mt4_prices[symbol] = data
     return jsonify({"success": True})
@@ -243,7 +245,9 @@ def get_price(symbol):
 # ── BOUGIES H1 ────────────────────────────────────────────────
 @app.route("/candles", methods=["POST"])
 def receive_candles():
-    data = request.json
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"error": "JSON invalide"}), 400
     symbol = data.get("symbol","").upper().replace("/","")
     mt4_candles[symbol] = data
     print(f"Bougies H1: {symbol} — {len(data.get('candles',[]))} bougies")
@@ -259,7 +263,9 @@ def get_candles(symbol):
 # ── BOUGIES M15 ───────────────────────────────────────────────
 @app.route("/m15", methods=["POST"])
 def receive_m15():
-    data = request.json
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"error": "JSON invalide"}), 400
     symbol = data.get("symbol","").upper().replace("/","")
     mt4_m15[symbol] = data
     print(f"Bougies M15: {symbol} — {len(data.get('candles',[]))} bougies")
@@ -275,7 +281,9 @@ def get_m15(symbol):
 # ── BOUGIES DAILY ─────────────────────────────────────────────
 @app.route("/daily", methods=["POST"])
 def receive_daily():
-    data = request.json
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"error": "JSON invalide"}), 400
     symbol = data.get("symbol","").upper().replace("/","")
     mt4_daily[symbol] = data
     print(f"Daily: {symbol} — {len(data.get('candles',[]))} bougies")
