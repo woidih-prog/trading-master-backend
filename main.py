@@ -263,8 +263,11 @@ def get_candles(symbol):
 # ── BOUGIES M15 ───────────────────────────────────────────────
 @app.route("/m15", methods=["POST"])
 def receive_m15():
+    raw = request.get_data(as_text=True)
+    print(f"M15 RAW ({len(raw)} chars): {raw[:300]}")
     data = request.get_json(force=True, silent=True)
     if not data:
+        print(f"M15 JSON echec raw: {raw[:500]}")
         return jsonify({"error": "JSON invalide"}), 400
     symbol = data.get("symbol","").upper().replace("/","")
     mt4_m15[symbol] = data
