@@ -2,7 +2,8 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 import os
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from datetime import datetime
 import pytz
 import threading
@@ -18,9 +19,9 @@ TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_KEY")
 REDIS_URL        = os.environ.get("REDIS_URL", "redis://red-d8j855mq1p3s73ff62ig:6379")
-DB_PATH          = "/tmp/journal.db"
+DATABASE_URL     = os.environ.get("DATABASE_URL")
 
-# Connexion Redis
+# ── REDIS ─────────────────────────────────────────────────────
 try:
     r = redis.from_url(REDIS_URL, decode_responses=True)
     r.ping()
@@ -29,18 +30,17 @@ except Exception as e:
     print(f"Redis erreur: {e}")
     r = None
 
-# Fallback RAM si Redis indisponible
-mt4_prices_ram      = {}
-mt4_candles_ram     = {}
-mt4_m15_ram         = {}
-mt4_daily_ram       = {}
+mt4_prices_ram  = {}
+mt4_candles_ram = {}
+mt4_m15_ram     = {}
+mt4_daily_ram   = {}
 mt4_screenshots_ram = {}
-pending_feedback    = {}
+pending_feedback = {}
 
 def redis_set(key, data):
     if r:
         try:
-            r.set(key, json.dumps(data), ex=86400)  # expire apres 24h
+            r.set(key, json.dumps(data), ex=86400)
             return True
         except: pass
     return False
@@ -53,26 +53,31 @@ def redis_get(key):
         except: pass
     return None
 
+# ── POSTGRESQL ────────────────────────────────────────────────
+def get_db():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS journal (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT, pair TEXT, tf TEXT, session TEXT,
-        score INTEGER, decision TEXT, bias TEXT,
-        entry TEXT, sl TEXT, tp TEXT, rr TEXT,
-        resultat TEXT, contexte_marche TEXT, difficulte TEXT,
-        pnl REAL, commentaire TEXT, created_at TEXT
-    )''')
-    try: c.execute("ALTER TABLE journal ADD COLUMN contexte_marche TEXT")
-    except: pass
-    try: c.execute("ALTER TABLE journal ADD COLUMN difficulte TEXT")
-    except: pass
-    conn.commit()
-    conn.close()
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS journal (
+            id SERIAL PRIMARY KEY,
+            date TEXT, pair TEXT, tf TEXT, session TEXT,
+            score INTEGER, decision TEXT, bias TEXT,
+            entry TEXT, sl TEXT, tp TEXT, rr TEXT,
+            resultat TEXT, contexte_marche TEXT, difficulte TEXT,
+            pnl REAL, commentaire TEXT, created_at TEXT
+        )''')
+        conn.commit()
+        conn.close()
+        print("PostgreSQL connecte OK")
+    except Exception as e:
+        print(f"PostgreSQL erreur: {e}")
 
 init_db()
 
+# ── HELPERS TELEGRAM ──────────────────────────────────────────
 def send_tg(chat_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if reply_markup:
@@ -91,7 +96,7 @@ def answer_callback(callback_id, text="OK"):
 @app.route("/")
 def home():
     redis_status = "OK" if r else "RAM fallback"
-    return f"Trading Master V5 Backend OK — Redis: {redis_status}"
+    return f"Trading Master V5 Backend OK — Redis: {redis_status} — DB: PostgreSQL"
 
 # ── TELEGRAM ──────────────────────────────────────────────────
 @app.route("/telegram", methods=["POST"])
@@ -188,12 +193,13 @@ def telegram_webhook():
             label_r = {"win":"✅ WIN","loss":"❌ LOSS","be":"➖ BE"}.get(resultat, resultat)
             label_c = {"trend":"📈 TREND","range":"📦 RANGE","manipulation":"🪤 MANIPULATION"}.get(contexte, contexte)
             try:
-                conn = sqlite3.connect(DB_PATH)
+                conn = get_db()
                 c = conn.cursor()
-                c.execute("UPDATE journal SET resultat=?, contexte_marche=?, difficulte=? WHERE id=?",
+                c.execute("UPDATE journal SET resultat=%s, contexte_marche=%s, difficulte=%s WHERE id=%s",
                     (resultat, contexte, difficulte, int(trade_id)))
                 conn.commit()
                 conn.close()
+                print(f"Journal mis a jour: trade #{trade_id} = {resultat} / {contexte} / {difficulte}")
             except Exception as e:
                 print(f"Erreur update journal: {e}")
             answer_callback(callback_id, "Journal mis à jour !")
@@ -224,11 +230,9 @@ def anthropic():
 @app.route("/price", methods=["POST"])
 def receive_price():
     data = request.get_json(force=True, silent=True)
-    if not data:
-        return jsonify({"error": "JSON invalide"}), 400
+    if not data: return jsonify({"error": "JSON invalide"}), 400
     symbol = data.get("symbol","").upper().replace("/","")
-    if not redis_set(f"price:{symbol}", data):
-        mt4_prices_ram[symbol] = data
+    if not redis_set(f"price:{symbol}", data): mt4_prices_ram[symbol] = data
     return jsonify({"success": True})
 
 @app.route("/price/<symbol>", methods=["GET"])
@@ -242,11 +246,9 @@ def get_price(symbol):
 @app.route("/candles", methods=["POST"])
 def receive_candles():
     data = request.get_json(force=True, silent=True)
-    if not data:
-        return jsonify({"error": "JSON invalide"}), 400
+    if not data: return jsonify({"error": "JSON invalide"}), 400
     symbol = data.get("symbol","").upper().replace("/","")
-    if not redis_set(f"candles:{symbol}", data):
-        mt4_candles_ram[symbol] = data
+    if not redis_set(f"candles:{symbol}", data): mt4_candles_ram[symbol] = data
     print(f"Bougies H1: {symbol} — {len(data.get('candles',[]))} bougies")
     return jsonify({"success": True})
 
@@ -261,14 +263,12 @@ def get_candles(symbol):
 @app.route("/m15", methods=["POST"])
 def receive_m15():
     raw = request.get_data(as_text=True)
-    print(f"M15 RAW ({len(raw)} chars): {raw[:200]}")
     data = request.get_json(force=True, silent=True)
     if not data:
-        print(f"M15 JSON echec: {raw[:300]}")
+        print(f"M15 JSON echec: {raw[:200]}")
         return jsonify({"error": "JSON invalide"}), 400
     symbol = data.get("symbol","").upper().replace("/","")
-    if not redis_set(f"m15:{symbol}", data):
-        mt4_m15_ram[symbol] = data
+    if not redis_set(f"m15:{symbol}", data): mt4_m15_ram[symbol] = data
     print(f"Bougies M15: {symbol} — {len(data.get('candles',[]))} bougies")
     return jsonify({"success": True})
 
@@ -283,11 +283,9 @@ def get_m15(symbol):
 @app.route("/daily", methods=["POST"])
 def receive_daily():
     data = request.get_json(force=True, silent=True)
-    if not data:
-        return jsonify({"error": "JSON invalide"}), 400
+    if not data: return jsonify({"error": "JSON invalide"}), 400
     symbol = data.get("symbol","").upper().replace("/","")
-    if not redis_set(f"daily:{symbol}", data):
-        mt4_daily_ram[symbol] = data
+    if not redis_set(f"daily:{symbol}", data): mt4_daily_ram[symbol] = data
     print(f"Daily: {symbol} — {len(data.get('candles',[]))} bougies")
     return jsonify({"success": True})
 
@@ -302,8 +300,7 @@ def get_daily(symbol):
 @app.route("/screenshot", methods=["POST"])
 def receive_screenshot():
     data = request.get_json(force=True, silent=True)
-    if not data:
-        return jsonify({"error": "JSON invalide"}), 400
+    if not data: return jsonify({"error": "JSON invalide"}), 400
     symbol = data.get("symbol","").upper().replace("/","")
     mt4_screenshots_ram[symbol] = data
     return jsonify({"success": True})
@@ -319,69 +316,79 @@ def get_screenshot(symbol):
 @app.route("/journal", methods=["POST"])
 def add_trade():
     data = request.get_json(force=True, silent=True)
-    if not data:
-        return jsonify({"error": "JSON invalide"}), 400
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''INSERT INTO journal
-        (date,pair,tf,session,score,decision,bias,entry,sl,tp,rr,resultat,contexte_marche,difficulte,pnl,commentaire,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-        (data.get("date"),data.get("pair"),data.get("tf"),data.get("session"),data.get("score"),
-         data.get("decision"),data.get("bias"),data.get("entry"),data.get("sl"),data.get("tp"),
-         data.get("rr"),data.get("resultat"),data.get("contexte_marche"),data.get("difficulte"),
-         data.get("pnl"),data.get("commentaire"),datetime.now().isoformat()))
-    conn.commit()
-    trade_id = c.lastrowid
-    conn.close()
-    return jsonify({"success": True, "id": trade_id})
+    if not data: return jsonify({"error": "JSON invalide"}), 400
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''INSERT INTO journal
+            (date,pair,tf,session,score,decision,bias,entry,sl,tp,rr,resultat,contexte_marche,difficulte,pnl,commentaire,created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id''',
+            (data.get("date"),data.get("pair"),data.get("tf"),data.get("session"),data.get("score"),
+             data.get("decision"),data.get("bias"),data.get("entry"),data.get("sl"),data.get("tp"),
+             data.get("rr"),data.get("resultat"),data.get("contexte_marche"),data.get("difficulte"),
+             data.get("pnl"),data.get("commentaire"),datetime.now().isoformat()))
+        conn.commit()
+        trade_id = c.fetchone()["id"]
+        conn.close()
+        return jsonify({"success": True, "id": trade_id})
+    except Exception as e:
+        print(f"Erreur add_trade: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/journal", methods=["GET"])
 def get_trades():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT * FROM journal ORDER BY id DESC LIMIT 100")
-    rows = c.fetchall()
-    cols = [d[0] for d in c.description]
-    conn.close()
-    return jsonify([dict(zip(cols,r)) for r in rows])
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT * FROM journal ORDER BY id DESC LIMIT 100")
+        rows = c.fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/journal/<int:trade_id>", methods=["PUT"])
 def update_trade(trade_id):
     data = request.get_json(force=True, silent=True)
-    if not data:
-        return jsonify({"error": "JSON invalide"}), 400
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE journal SET resultat=?,contexte_marche=?,difficulte=?,pnl=?,commentaire=? WHERE id=?",
-        (data.get("resultat"),data.get("contexte_marche"),data.get("difficulte"),
-         data.get("pnl"),data.get("commentaire"),trade_id))
-    conn.commit()
-    conn.close()
-    return jsonify({"success": True})
+    if not data: return jsonify({"error": "JSON invalide"}), 400
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("UPDATE journal SET resultat=%s,contexte_marche=%s,difficulte=%s,pnl=%s,commentaire=%s WHERE id=%s",
+            (data.get("resultat"),data.get("contexte_marche"),data.get("difficulte"),
+             data.get("pnl"),data.get("commentaire"),trade_id))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/journal/stats", methods=["GET"])
 def get_stats():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    stats = {}
-    c.execute("SELECT COUNT(*) FROM journal"); stats["total"] = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM journal WHERE resultat='win'"); stats["wins"] = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM journal WHERE resultat='loss'"); stats["losses"] = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM journal WHERE resultat='be'"); stats["be"] = c.fetchone()[0]
-    c.execute("SELECT SUM(pnl) FROM journal WHERE pnl IS NOT NULL"); stats["total_pnl"] = round(c.fetchone()[0] or 0, 2)
-    c.execute("SELECT COUNT(*) FROM journal WHERE resultat IS NOT NULL AND resultat!=''")
-    done = c.fetchone()[0]
-    stats["winrate"] = round(stats["wins"]/done*100) if done > 0 else 0
-    for ctx in ["trend","range","manipulation"]:
-        c.execute("SELECT COUNT(*) FROM journal WHERE contexte_marche=?", (ctx,)); total_ctx = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM journal WHERE contexte_marche=? AND resultat='win'", (ctx,)); wins_ctx = c.fetchone()[0]
-        stats[f"ctx_{ctx}"] = {"total":total_ctx,"wins":wins_ctx,"winrate":round(wins_ctx/total_ctx*100) if total_ctx>0 else 0}
-    for diff in ["easy","medium","hard"]:
-        c.execute("SELECT COUNT(*) FROM journal WHERE difficulte=?", (diff,)); total_d = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM journal WHERE difficulte=? AND resultat='win'", (diff,)); wins_d = c.fetchone()[0]
-        stats[f"diff_{diff}"] = {"total":total_d,"wins":wins_d,"winrate":round(wins_d/total_d*100) if total_d>0 else 0}
-    conn.close()
-    return jsonify(stats)
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        stats = {}
+        c.execute("SELECT COUNT(*) as n FROM journal"); stats["total"] = c.fetchone()["n"]
+        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat='win'"); stats["wins"] = c.fetchone()["n"]
+        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat='loss'"); stats["losses"] = c.fetchone()["n"]
+        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat='be'"); stats["be"] = c.fetchone()["n"]
+        c.execute("SELECT SUM(pnl) as s FROM journal WHERE pnl IS NOT NULL"); stats["total_pnl"] = round(c.fetchone()["s"] or 0, 2)
+        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat IS NOT NULL AND resultat!=''")
+        done = c.fetchone()["n"]
+        stats["winrate"] = round(stats["wins"]/done*100) if done > 0 else 0
+        for ctx in ["trend","range","manipulation"]:
+            c.execute("SELECT COUNT(*) as n FROM journal WHERE contexte_marche=%s", (ctx,)); total_ctx = c.fetchone()["n"]
+            c.execute("SELECT COUNT(*) as n FROM journal WHERE contexte_marche=%s AND resultat='win'", (ctx,)); wins_ctx = c.fetchone()["n"]
+            stats[f"ctx_{ctx}"] = {"total":total_ctx,"wins":wins_ctx,"winrate":round(wins_ctx/total_ctx*100) if total_ctx>0 else 0}
+        for diff in ["easy","medium","hard"]:
+            c.execute("SELECT COUNT(*) as n FROM journal WHERE difficulte=%s", (diff,)); total_d = c.fetchone()["n"]
+            c.execute("SELECT COUNT(*) as n FROM journal WHERE difficulte=%s AND resultat='win'", (diff,)); wins_d = c.fetchone()["n"]
+            stats[f"diff_{diff}"] = {"total":total_d,"wins":wins_d,"winrate":round(wins_d/total_d*100) if total_d>0 else 0}
+        conn.close()
+        return jsonify(stats)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ── SCHEDULER ─────────────────────────────────────────────────
 def scheduler_job():
@@ -409,7 +416,6 @@ def trigger_analysis(session):
             json={"chat_id": TELEGRAM_CHAT_ID,
                   "text": f"Trading Master V5 — {session}\nAnalyse automatique declenchee.",
                   "parse_mode": "HTML"})
-        print(f"Scheduler: {session} declenche")
     except Exception as e:
         print(f"Trigger error: {e}")
 
