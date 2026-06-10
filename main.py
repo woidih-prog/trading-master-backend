@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+afrom flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 import os
@@ -389,6 +389,105 @@ def get_stats():
         return jsonify(stats)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+# ── JOURNAL CONTEXT POUR LES AGENTS ──────────────
+@app.route("/journal/context", methods=["GET"])
+def get_journal_context():
+    try:
+        conn = get_db()
+        c = conn.cursor()
+
+        # Stats globales
+        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat IS NOT NULL AND resultat!=''")
+        total_done = c.fetchone()["n"]
+
+        if total_done == 0:
+            conn.close()
+            return jsonify({"context": "", "has_data": False})
+
+        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat='win'")
+        wins = c.fetchone()["n"]
+        winrate = round(wins/total_done*100) if total_done > 0 else 0
+
+        # Stats par paire (top 5)
+        c.execute("""
+            SELECT pair, COUNT(*) as total,
+            SUM(CASE WHEN resultat='win' THEN 1 ELSE 0 END) as wins
+            FROM journal WHERE resultat IS NOT NULL AND resultat!='' AND pair IS NOT NULL
+            GROUP BY pair ORDER BY total DESC LIMIT 5
+        """)
+        pairs_stats = c.fetchall()
+
+        # Stats par type de marche
+        c.execute("""
+            SELECT contexte_marche, COUNT(*) as total,
+            SUM(CASE WHEN resultat='win' THEN 1 ELSE 0 END) as wins
+            FROM journal WHERE resultat IS NOT NULL AND resultat!='' AND contexte_marche IS NOT NULL
+            GROUP BY contexte_marche
+        """)
+        marche_stats = c.fetchall()
+
+        # Stats par difficulte
+        c.execute("""
+            SELECT difficulte, COUNT(*) as total,
+            SUM(CASE WHEN resultat='win' THEN 1 ELSE 0 END) as wins
+            FROM journal WHERE resultat IS NOT NULL AND resultat!='' AND difficulte IS NOT NULL
+            GROUP BY difficulte
+        """)
+        diff_stats = c.fetchall()
+
+        # Stats par session
+        c.execute("""
+            SELECT session, COUNT(*) as total,
+            SUM(CASE WHEN resultat='win' THEN 1 ELSE 0 END) as wins
+            FROM journal WHERE resultat IS NOT NULL AND resultat!='' AND session IS NOT NULL
+            GROUP BY session ORDER BY total DESC
+        """)
+        session_stats = c.fetchall()
+
+        # SL touche trop souvent (trades perdants)
+        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat='loss'")
+        losses = c.fetchone()["n"]
+
+        # Construire le contexte texte pour les agents
+        ctx = f"HISTORIQUE PERSONNEL TRADER ({total_done} trades journalises) :\n"
+        ctx += f"- Winrate global : {winrate}% ({wins} wins / {losses} pertes)\n"
+
+        if pairs_stats:
+            ctx += "- Performance par paire :\n"
+            for p in pairs_stats:
+                wr = round(p['wins']/p['total']*100) if p['total'] > 0 else 0
+                ctx += f"  {p['pair']} : {wr}% winrate sur {p['total']} trades\n"
+
+        if marche_stats:
+            ctx += "- Performance par type de marche :\n"
+            for m in marche_stats:
+                wr = round(m['wins']/m['total']*100) if m['total'] > 0 else 0
+                ctx += f"  {m['contexte_marche'].upper()} : {wr}% winrate sur {m['total']} trades\n"
+
+        if diff_stats:
+            ctx += "- Performance par difficulte :\n"
+            for d in diff_stats:
+                wr = round(d['wins']/d['total']*100) if d['total'] > 0 else 0
+                ctx += f"  {d['difficulte'].upper()} : {wr}% winrate sur {d['total']} trades\n"
+
+        if session_stats:
+            ctx += "- Performance par session :\n"
+            for s in session_stats:
+                wr = round(s['wins']/s['total']*100) if s['total'] > 0 else 0
+                ctx += f"  {s['session']} : {wr}% winrate sur {s['total']} trades\n"
+
+        ctx += "INSTRUCTION : Utilise ces donnees reelles pour ajuster ton score. "
+        ctx += "Si winrate < 40% sur cette paire ou ce contexte, reduire le score de 3pts. "
+        ctx += "Si winrate > 70%, augmenter le score de 2pts. "
+        ctx += "Si moins de 5 trades sur cette paire, donnee insuffisante - ne pas ajuster."
+
+        conn.close()
+        return jsonify({"context": ctx, "has_data": True, "total_trades": total_done})
+
+    except Exception as e:
+        print(f"Erreur journal/context: {e}")
+        return jsonify({"context": "", "has_data": False})
 
 # ── SCHEDULER ─────────────────────────────────────────────────
 def scheduler_job():
