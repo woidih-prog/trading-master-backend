@@ -107,8 +107,18 @@ def telegram():
     text = data.get("text", "")
     trade_id = data.get("trade_id")
 
+    ftmo_override = data.get("ftmo_override", False)
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
-    if trade_id:
+
+    if trade_id and ftmo_override:
+        # Signal bloqué FTMO — boutons Ignorer/Ne pas prendre
+        payload["reply_markup"] = {
+            "inline_keyboard": [[
+                {"text": "⚠️ Ignorer FTMO — Je prends", "callback_data": f"ftmo_{trade_id}_take"},
+                {"text": "❌ Ne pas prendre",            "callback_data": f"ftmo_{trade_id}_skip"}
+            ]]
+        }
+    elif trade_id:
         payload["reply_markup"] = {
             "inline_keyboard": [[
                 {"text": "✅ WIN",  "callback_data": f"r_{trade_id}_win"},
@@ -144,7 +154,32 @@ def telegram_webhook():
     chat_id       = callback["message"]["chat"]["id"]
     message_id    = callback["message"]["message_id"]
 
-    if callback_data.startswith("r_"):
+    # ── FTMO OVERRIDE ────────────────────────────────
+    if callback_data.startswith("ftmo_"):
+        parts = callback_data.split("_")
+        if len(parts) == 3:
+            trade_id = parts[1]
+            action   = parts[2]  # take ou skip
+
+            if action == "skip":
+                answer_callback(callback_id, "Trade ignoré.")
+                edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+                send_tg(chat_id, "❌ Trade non pris — FTMO respecté.")
+
+            elif action == "take":
+                answer_callback(callback_id, "Trade pris malgré FTMO !")
+                edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+                # Envoyer les boutons WIN/LOSS/BE
+                pending_feedback[trade_id] = {"step":"resultat","chat_id":chat_id,"message_id":message_id}
+                send_tg(chat_id, "⚠️ FTMO ignoré — trade pris.\n\nRésultat du trade ?", {
+                    "inline_keyboard": [[
+                        {"text": "✅ WIN",  "callback_data": f"r_{trade_id}_win"},
+                        {"text": "❌ LOSS", "callback_data": f"r_{trade_id}_loss"},
+                        {"text": "➖ BE",   "callback_data": f"r_{trade_id}_be"}
+                    ]]
+                })
+
+    elif callback_data.startswith("r_"):
         parts = callback_data.split("_")
         if len(parts) == 3:
             trade_id = parts[1]
