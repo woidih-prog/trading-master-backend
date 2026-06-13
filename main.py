@@ -154,6 +154,40 @@ def telegram_webhook():
     if not data:
         return jsonify({"ok": True})
 
+    # ── MESSAGE TEXTE LIBRE (commentaire journal) ─────────────
+    message = data.get("message")
+    if message and not data.get("callback_query"):
+        chat_id_msg = message.get("chat", {}).get("id")
+        text_msg = message.get("text", "").strip()
+        if text_msg and chat_id_msg and str(chat_id_msg) == str(TELEGRAM_CHAT_ID):
+            # Chercher si un trade attend un commentaire
+            waiting_trade = None
+            for tid, fb in list(pending_feedback.items()):
+                if fb.get("step") == "commentaire":
+                    waiting_trade = tid
+                    break
+            if waiting_trade:
+                fb = pending_feedback[waiting_trade]
+                resultat   = fb.get("resultat","")
+                contexte   = fb.get("contexte","")
+                difficulte = fb.get("difficulte","")
+                label_r = {"win":"✅ WIN","loss":"❌ LOSS","be":"➖ BE"}.get(resultat, resultat)
+                label_c = {"trend":"📈 TREND","range":"📦 RANGE","manipulation":"🪤 MANIPULATION"}.get(contexte, contexte)
+                label_d = {"easy":"🟢 EASY","medium":"🟡 MEDIUM","hard":"🔴 HARD"}.get(difficulte, difficulte)
+                try:
+                    conn = get_db()
+                    c = conn.cursor()
+                    c.execute("UPDATE journal SET commentaire=%s WHERE id=%s",
+                        (text_msg, int(waiting_trade)))
+                    conn.commit()
+                    conn.close()
+                    print(f"Commentaire trade #{waiting_trade}: {text_msg[:50]}")
+                except Exception as e:
+                    print(f"Erreur commentaire: {e}")
+                send_tg(chat_id_msg, f"<b>✅ Trade #{waiting_trade} journalisé</b>\n{label_r} · {label_c} · {label_d}\n💬 <i>{text_msg[:100]}</i>")
+                pending_feedback.pop(waiting_trade, None)
+        return jsonify({"ok": True})
+
     callback = data.get("callback_query")
     if not callback:
         return jsonify({"ok": True})
@@ -280,12 +314,40 @@ def telegram_webhook():
                 print(f"Journal mis a jour: trade #{trade_id} = {resultat} / {contexte} / {difficulte}")
             except Exception as e:
                 print(f"Erreur update journal: {e}")
-            answer_callback(callback_id, "Journal mis à jour !")
+            answer_callback(callback_id, "Presque fini !")
             edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
-            send_tg(chat_id, f"<b>Trade #{trade_id} journalise</b>\nResultat: {label_r}\nMarche: {label_c}\nDifficulte: {label_d}")
-            pending_feedback.pop(trade_id, None)
+            # Passer à l'étape commentaire
+            fb["resultat"] = resultat
+            fb["contexte"] = contexte
+            fb["difficulte"] = difficulte
+            fb["step"] = "commentaire"
+            pending_feedback[trade_id] = fb
+            send_tg(chat_id,
+                f"{label_d} noté.\n\n<b>💬 Commentaire sur ce trade ?</b>\nTape ton analyse, ce que tu as vu, pourquoi tu as pris ou raté ce trade.\n\nOu appuie sur Passer pour terminer.",
+                {"inline_keyboard": [[{"text": "⏭️ Passer", "callback_data": f"skip_comment_{trade_id}"}]]})
+
+
+    # ── SKIP COMMENTAIRE ─────────────────────────────────────
+    elif callback_data.startswith("skip_comment_"):
+        trade_id = callback_data.replace("skip_comment_", "")
+        fb = pending_feedback.get(trade_id, {})
+        resultat   = fb.get("resultat","")
+        contexte   = fb.get("contexte","")
+        difficulte = fb.get("difficulte","")
+        label_r = {"win":"✅ WIN","loss":"❌ LOSS","be":"➖ BE"}.get(resultat, resultat)
+        label_c = {"trend":"📈 TREND","range":"📦 RANGE","manipulation":"🪤 MANIPULATION"}.get(contexte, contexte)
+        label_d = {"easy":"🟢 EASY","medium":"🟡 MEDIUM","hard":"🔴 HARD"}.get(difficulte, difficulte)
+        send_tg(chat_id, f"<b>✅ Trade #{trade_id} journalisé</b>\n{label_r} · {label_c} · {label_d}\n<i>Sans commentaire</i>")
+        answer_callback(callback_id, "Journalisé !")
+        edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+        pending_feedback.pop(trade_id, None)
 
     return jsonify({"ok": True})
+
+# ── MESSAGES TEXTE LIBRES (commentaires journal) ──────────────
+# Le webhook reçoit aussi les messages texte (pas seulement les callbacks)
+# On gère ça dans la même route en vérifiant "message" au lieu de "callback_query"
+# Note: la route /webhook/telegram gère les deux cas via le même endpoint
 
 @app.route("/setup/webhook", methods=["GET"])
 def setup_webhook():
