@@ -67,8 +67,15 @@ def init_db():
             score INTEGER, decision TEXT, bias TEXT,
             entry TEXT, sl TEXT, tp TEXT, rr TEXT,
             resultat TEXT, contexte_marche TEXT, difficulte TEXT,
-            pnl REAL, commentaire TEXT, created_at TEXT
+            pnl REAL, commentaire TEXT, created_at TEXT,
+            direction_ok TEXT, entree_ok TEXT, sortie_ok TEXT,
+            raison_sortie TEXT
         )''')
+        # Ajouter colonnes si elles n'existent pas (migration)
+        for col in ['direction_ok','entree_ok','sortie_ok','raison_sortie']:
+            try:
+                c.execute(f"ALTER TABLE journal ADD COLUMN {col} TEXT")
+            except: pass
         conn.commit()
         conn.close()
         print("PostgreSQL connecte OK")
@@ -461,12 +468,18 @@ def add_trade():
         conn = get_db()
         c = conn.cursor()
         c.execute('''INSERT INTO journal
-            (date,pair,tf,session,score,decision,bias,entry,sl,tp,rr,resultat,contexte_marche,difficulte,pnl,commentaire,created_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id''',
-            (data.get("date"),data.get("pair"),data.get("tf"),data.get("session"),data.get("score"),
-             data.get("decision"),data.get("bias"),data.get("entry"),data.get("sl"),data.get("tp"),
-             data.get("rr"),data.get("resultat"),data.get("contexte_marche"),data.get("difficulte"),
-             data.get("pnl"),data.get("commentaire"),datetime.now().isoformat()))
+            (date,pair,tf,session,score,decision,bias,entry,sl,tp,rr,
+             resultat,contexte_marche,difficulte,pnl,commentaire,created_at,
+             direction_ok,entree_ok,sortie_ok,raison_sortie)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id''',
+            (data.get("date"),data.get("pair"),data.get("tf"),data.get("session"),
+             data.get("score"),data.get("decision"),data.get("bias"),
+             data.get("entry"),data.get("sl"),data.get("tp"),data.get("rr"),
+             data.get("resultat"),data.get("contexte_marche"),data.get("difficulte"),
+             data.get("pnl"),data.get("commentaire"),datetime.now().isoformat(),
+             data.get("direction_ok"),data.get("entree_ok"),
+             data.get("sortie_ok"),data.get("raison_sortie")))
         conn.commit()
         trade_id = c.fetchone()["id"]
         conn.close()
@@ -587,7 +600,27 @@ def get_journal_context():
         ctx += "INSTRUCTION : Utilise ces donnees reelles pour ajuster ton score. "
         ctx += "Si winrate < 40% sur cette paire ou ce contexte, reduire le score de 3pts. "
         ctx += "Si winrate > 70%, augmenter le score de 2pts. "
-        ctx += "Si moins de 5 trades sur cette paire, donnee insuffisante - ne pas ajuster."
+        ctx += "Si moins de 5 trades sur cette paire, donnee insuffisante - ne pas ajuster. "
+
+        # Stats qualité des trades
+        c.execute("""
+            SELECT
+              SUM(CASE WHEN direction_ok='oui' THEN 1 ELSE 0 END) as dir_ok,
+              SUM(CASE WHEN direction_ok='non' THEN 1 ELSE 0 END) as dir_nok,
+              SUM(CASE WHEN sortie_ok='be_force' THEN 1 ELSE 0 END) as be_force,
+              SUM(CASE WHEN raison_sortie='ny_trap' THEN 1 ELSE 0 END) as ny_trap,
+              SUM(CASE WHEN raison_sortie='sl_manuel' THEN 1 ELSE 0 END) as sl_manuel,
+              SUM(CASE WHEN raison_sortie='trailing_manquant' THEN 1 ELSE 0 END) as trailing
+            FROM journal WHERE resultat IS NOT NULL AND resultat!=''
+        """)
+        qualite = c.fetchone()
+        if qualite and qualite['dir_ok']:
+            ctx += f"\nQUALITE ANALYSE (independant du resultat): "
+            ctx += f"Direction correcte={qualite['dir_ok']} fois. "
+            if qualite['be_force']: ctx += f"BE force (bon trade mal gere)={qualite['be_force']} fois. "
+            if qualite['ny_trap']: ctx += f"Sorties NY Trap={qualite['ny_trap']} fois (trailing stop manquant). "
+            if qualite['sl_manuel']: ctx += f"Deplacements SL manuel={qualite['sl_manuel']} fois. "
+            ctx += "IMPORTANT: Un BE force n est PAS un mauvais trade — ne pas penaliser la direction."
         conn.close()
         return jsonify({"context": ctx, "has_data": True, "total_trades": total_done})
     except Exception as e:
