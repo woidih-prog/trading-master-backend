@@ -356,7 +356,20 @@ def telegram_webhook():
 # On gère ça dans la même route en vérifiant "message" au lieu de "callback_query"
 # Note: la route /webhook/telegram gère les deux cas via le même endpoint
 
-@app.route("/setup/webhook", methods=["GET"])
+@app.route("/admin/reset-journal", methods=["GET"])
+def reset_journal():
+    secret = request.args.get("key","")
+    if secret != "RENARD2026":
+        return jsonify({"error": "Non autorise"}), 403
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("TRUNCATE TABLE journal RESTART IDENTITY")
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True, "message": "Journal reinitialise — repartez a zero !"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 def setup_webhook():
     webhook_url = "https://trading-master-backend.onrender.com/webhook/telegram"
     resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook", json={"url": webhook_url})
@@ -549,78 +562,88 @@ def get_journal_context():
     try:
         conn = get_db()
         c = conn.cursor()
-        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat IS NOT NULL AND resultat!=''")
+
+        # FILTRE STRICT : uniquement les trades réellement pris
+        # Exclure : décision ATTENDRE auto, trades sans résultat, opportunités manquées
+        FILTRE = """
+            resultat IN ('win','loss','be')
+            AND (commentaire NOT LIKE '%%opportunite_manquee%%' OR commentaire IS NULL)
+            AND (commentaire NOT LIKE '%%TRADE NON PRIS%%' OR commentaire IS NULL)
+        """
+
+        c.execute(f"SELECT COUNT(*) as n FROM journal WHERE {FILTRE}")
         total_done = c.fetchone()["n"]
         if total_done == 0:
             conn.close()
             return jsonify({"context": "", "has_data": False})
-        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat='win'")
+
+        c.execute(f"SELECT COUNT(*) as n FROM journal WHERE {FILTRE} AND resultat='win'")
         wins = c.fetchone()["n"]
+        c.execute(f"SELECT COUNT(*) as n FROM journal WHERE {FILTRE} AND resultat='loss'")
+        losses = c.fetchone()["n"]
         winrate = round(wins/total_done*100) if total_done > 0 else 0
-        c.execute("""SELECT pair, COUNT(*) as total, SUM(CASE WHEN resultat='win' THEN 1 ELSE 0 END) as wins
-            FROM journal WHERE resultat IS NOT NULL AND resultat!='' AND pair IS NOT NULL
-            GROUP BY pair ORDER BY total DESC LIMIT 5""")
+
+        c.execute(f"""SELECT pair, COUNT(*) as total,
+            SUM(CASE WHEN resultat='win' THEN 1 ELSE 0 END) as wins
+            FROM journal WHERE {FILTRE} AND pair IS NOT NULL
+            GROUP BY pair ORDER BY total DESC LIMIT 8""")
         pairs_stats = c.fetchall()
-        c.execute("""SELECT contexte_marche, COUNT(*) as total, SUM(CASE WHEN resultat='win' THEN 1 ELSE 0 END) as wins
-            FROM journal WHERE resultat IS NOT NULL AND resultat!='' AND contexte_marche IS NOT NULL
+
+        c.execute(f"""SELECT contexte_marche, COUNT(*) as total,
+            SUM(CASE WHEN resultat='win' THEN 1 ELSE 0 END) as wins
+            FROM journal WHERE {FILTRE} AND contexte_marche IS NOT NULL
             GROUP BY contexte_marche""")
         marche_stats = c.fetchall()
-        c.execute("""SELECT difficulte, COUNT(*) as total, SUM(CASE WHEN resultat='win' THEN 1 ELSE 0 END) as wins
-            FROM journal WHERE resultat IS NOT NULL AND resultat!='' AND difficulte IS NOT NULL
-            GROUP BY difficulte""")
-        diff_stats = c.fetchall()
-        c.execute("""SELECT session, COUNT(*) as total, SUM(CASE WHEN resultat='win' THEN 1 ELSE 0 END) as wins
-            FROM journal WHERE resultat IS NOT NULL AND resultat!='' AND session IS NOT NULL
+
+        c.execute(f"""SELECT session, COUNT(*) as total,
+            SUM(CASE WHEN resultat='win' THEN 1 ELSE 0 END) as wins
+            FROM journal WHERE {FILTRE} AND session IS NOT NULL
             GROUP BY session ORDER BY total DESC""")
         session_stats = c.fetchall()
-        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat='loss'")
-        losses = c.fetchone()["n"]
-        ctx = f"HISTORIQUE PERSONNEL TRADER ({total_done} trades journalises) :\n"
+
+        ctx = f"HISTORIQUE TRADES REELS ({total_done} trades pris) :\n"
         ctx += f"- Winrate global : {winrate}% ({wins} wins / {losses} pertes)\n"
+
         if pairs_stats:
             ctx += "- Performance par paire :\n"
             for p in pairs_stats:
                 wr = round(p['wins']/p['total']*100) if p['total'] > 0 else 0
-                ctx += f"  {p['pair']} : {wr}% winrate sur {p['total']} trades\n"
+                adj = "" if p['total'] >= 5 else " (N<5 — donnee insuffisante)"
+                ctx += f"  {p['pair']} : {wr}% sur {p['total']} trades{adj}\n"
+
         if marche_stats:
-            ctx += "- Performance par type de marche :\n"
+            ctx += "- Performance par marche :\n"
             for m in marche_stats:
                 wr = round(m['wins']/m['total']*100) if m['total'] > 0 else 0
-                ctx += f"  {m['contexte_marche'].upper()} : {wr}% winrate sur {m['total']} trades\n"
-        if diff_stats:
-            ctx += "- Performance par difficulte :\n"
-            for d in diff_stats:
-                wr = round(d['wins']/d['total']*100) if d['total'] > 0 else 0
-                ctx += f"  {d['difficulte'].upper()} : {wr}% winrate sur {d['total']} trades\n"
+                ctx += f"  {m['contexte_marche'].upper()} : {wr}% sur {m['total']} trades\n"
+
         if session_stats:
             ctx += "- Performance par session :\n"
             for s in session_stats:
                 wr = round(s['wins']/s['total']*100) if s['total'] > 0 else 0
-                ctx += f"  {s['session']} : {wr}% winrate sur {s['total']} trades\n"
-        ctx += "INSTRUCTION : Utilise ces donnees reelles pour ajuster ton score. "
-        ctx += "Si winrate < 40% sur cette paire ou ce contexte, reduire le score de 3pts. "
-        ctx += "Si winrate > 70%, augmenter le score de 2pts. "
-        ctx += "Si moins de 5 trades sur cette paire, donnee insuffisante - ne pas ajuster. "
+                adj = "" if s['total'] >= 5 else " (N<5 — donnee insuffisante)"
+                ctx += f"  {s['session']} : {wr}% sur {s['total']} trades{adj}\n"
 
-        # Stats qualité des trades
-        c.execute("""
-            SELECT
-              SUM(CASE WHEN direction_ok='oui' THEN 1 ELSE 0 END) as dir_ok,
-              SUM(CASE WHEN direction_ok='non' THEN 1 ELSE 0 END) as dir_nok,
-              SUM(CASE WHEN sortie_ok='be_force' THEN 1 ELSE 0 END) as be_force,
-              SUM(CASE WHEN raison_sortie='ny_trap' THEN 1 ELSE 0 END) as ny_trap,
-              SUM(CASE WHEN raison_sortie='sl_manuel' THEN 1 ELSE 0 END) as sl_manuel,
-              SUM(CASE WHEN raison_sortie='trailing_manquant' THEN 1 ELSE 0 END) as trailing
-            FROM journal WHERE resultat IS NOT NULL AND resultat!=''
-        """)
+        ctx += "\nINSTRUCTION : "
+        ctx += "Ajuster le score UNIQUEMENT si N>=5 trades sur ce contexte. "
+        ctx += "N<5 = donnee insuffisante = ne pas ajuster. "
+        ctx += "Winrate < 40% et N>=5 = reduire score -2pts. "
+        ctx += "Winrate > 65% et N>=5 = bonus +2pts. "
+
+        # Stats qualité
+        c.execute(f"""SELECT
+            SUM(CASE WHEN direction_ok='oui' THEN 1 ELSE 0 END) as dir_ok,
+            SUM(CASE WHEN sortie_ok='be_force' THEN 1 ELSE 0 END) as be_force,
+            SUM(CASE WHEN raison_sortie='ny_trap' THEN 1 ELSE 0 END) as ny_trap,
+            SUM(CASE WHEN raison_sortie='sl_manuel' THEN 1 ELSE 0 END) as sl_manuel
+            FROM journal WHERE {FILTRE}""")
         qualite = c.fetchone()
         if qualite and qualite['dir_ok']:
-            ctx += f"\nQUALITE ANALYSE (independant du resultat): "
-            ctx += f"Direction correcte={qualite['dir_ok']} fois. "
-            if qualite['be_force']: ctx += f"BE force (bon trade mal gere)={qualite['be_force']} fois. "
-            if qualite['ny_trap']: ctx += f"Sorties NY Trap={qualite['ny_trap']} fois (trailing stop manquant). "
-            if qualite['sl_manuel']: ctx += f"Deplacements SL manuel={qualite['sl_manuel']} fois. "
-            ctx += "IMPORTANT: Un BE force n est PAS un mauvais trade — ne pas penaliser la direction."
+            ctx += f"\nQUALITE : Direction correcte={qualite['dir_ok']} fois. "
+            if qualite['be_force']: ctx += f"BE force (bon trade)={qualite['be_force']} fois. "
+            if qualite['ny_trap']: ctx += f"NY Trap={qualite['ny_trap']} fois. "
+            ctx += "BE force = bon trade mal gere, ne pas penaliser la direction."
+
         conn.close()
         return jsonify({"context": ctx, "has_data": True, "total_trades": total_done})
     except Exception as e:
