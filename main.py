@@ -356,20 +356,6 @@ def telegram_webhook():
 # On gère ça dans la même route en vérifiant "message" au lieu de "callback_query"
 # Note: la route /webhook/telegram gère les deux cas via le même endpoint
 
-@app.route("/admin/reset-journal", methods=["GET"])
-def reset_journal():
-    secret = request.args.get("key","")
-    if secret != "RENARD2026":
-        return jsonify({"error": "Non autorise"}), 403
-    try:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("TRUNCATE TABLE journal RESTART IDENTITY")
-        conn.commit()
-        conn.close()
-        return jsonify({"success": True, "message": "Journal reinitialise — repartez a zero !"})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 def setup_webhook():
     webhook_url = "https://trading-master-backend.onrender.com/webhook/telegram"
     resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook", json={"url": webhook_url})
