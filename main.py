@@ -356,6 +356,23 @@ def telegram_webhook():
 # On gère ça dans la même route en vérifiant "message" au lieu de "callback_query"
 # Note: la route /webhook/telegram gère les deux cas via le même endpoint
 
+@app.route("/admin/reset-journal", methods=["GET"])
+def reset_journal():
+    secret = request.args.get("key","")
+    if secret != "RENARD2026":
+        return jsonify({"error": "Non autorise"}), 403
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        # Garder uniquement les trades d'aujourd'hui (19/06/2026)
+        c.execute("DELETE FROM journal WHERE created_at NOT LIKE '2026-06-19%'")
+        deleted = c.rowcount
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True, "message": f"{deleted} anciens trades supprimes. Trades du 19/06 conserves."})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 def setup_webhook():
     webhook_url = "https://trading-master-backend.onrender.com/webhook/telegram"
     resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook", json={"url": webhook_url})
@@ -630,6 +647,16 @@ def get_journal_context():
             if qualite['ny_trap']: ctx += f"NY Trap={qualite['ny_trap']} fois. "
             ctx += "BE force = bon trade mal gere, ne pas penaliser la direction."
 
+        # Ajouter les news macro si disponibles
+        if redis_client:
+            try:
+                news = redis_client.get("macro_news")
+                if news:
+                    news_txt = news.decode('utf-8') if isinstance(news, bytes) else news
+                    ctx += f"\n{news_txt}"
+            except:
+                pass
+
         conn.close()
         return jsonify({"context": ctx, "has_data": True, "total_trades": total_done})
     except Exception as e:
@@ -656,11 +683,38 @@ def scheduler_job():
             print(f"Scheduler error: {e}")
         time.sleep(30)
 
+def fetch_macro_news():
+    """Récupère les news macro depuis Alpha Vantage"""
+    try:
+        url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&topics=forex,economy_macro,financial_markets&sort=LATEST&limit=10&apikey=UCP44WUC4UHAJ2I8"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        feed = data.get("feed", [])
+        if not feed:
+            return ""
+        summary = "NEWS MACRO DU JOUR:\n"
+        for item in feed[:5]:
+            title = item.get("title","")
+            sentiment = item.get("overall_sentiment_label","neutral")
+            summary += f"- {title} [{sentiment}]\n"
+        if redis_client:
+            redis_client.setex("macro_news", 43200, summary)
+        print(f"News macro: {len(feed)} articles")
+        return summary
+    except Exception as e:
+        print(f"Erreur news macro: {e}")
+        return ""
+
 def trigger_analysis(session):
     try:
+        # Récupérer les news macro et les envoyer sur Telegram
+        news = fetch_macro_news()
+        msg = f"<b>Trading Master V5 — {session}</b>\nAnalyse automatique declenchee."
+        if news:
+            msg += f"\n\n{news}"
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID,
-                  "text": f"Trading Master V5 — {session}\nAnalyse automatique declenchee.",
+                  "text": msg,
                   "parse_mode": "HTML"})
     except Exception as e:
         print(f"Trigger error: {e}")
