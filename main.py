@@ -136,11 +136,16 @@ def telegram():
         }
     elif trade_id:
         payload["reply_markup"] = {
-            "inline_keyboard": [[
-                {"text": "✅ WIN",  "callback_data": f"r_{trade_id}_win"},
-                {"text": "❌ LOSS", "callback_data": f"r_{trade_id}_loss"},
-                {"text": "➖ BE",   "callback_data": f"r_{trade_id}_be"}
-            ]]
+            "inline_keyboard": [
+                [
+                    {"text": "✅ WIN",  "callback_data": f"r_{trade_id}_win"},
+                    {"text": "❌ LOSS", "callback_data": f"r_{trade_id}_loss"},
+                    {"text": "➖ BE",   "callback_data": f"r_{trade_id}_be"}
+                ],
+                [
+                    {"text": "⏭️ NON DÉCLENCHÉ", "callback_data": f"r_{trade_id}_nondeclenche"}
+                ]
+            ]
         }
 
     resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload).json()
@@ -333,6 +338,77 @@ def telegram_webhook():
                 f"{label_d} noté.\n\n<b>💬 Commentaire sur ce trade ?</b>\nTape ton analyse, ce que tu as vu, pourquoi tu as pris ou raté ce trade.\n\nOu appuie sur Passer pour terminer.",
                 {"inline_keyboard": [[{"text": "⏭️ Passer", "callback_data": f"skip_comment_{trade_id}"}]]})
 
+    # ── NON DÉCLENCHÉ ────────────────────────────────────────────
+    elif callback_data.startswith("r_") and "_nondeclenche" in callback_data:
+        trade_id = callback_data.split("_")[1]
+        fb = pending_feedback.get(trade_id, {})
+        fb["resultat"] = "nondeclenche"
+        fb["step"] = "nondeclenche_raison"
+        pending_feedback[trade_id] = fb
+        answer_callback(callback_id, "Ordre non déclenché")
+        edit_tg_markup(chat_id, message_id, {"inline_keyboard": [
+            [{"text": "📍 Point d'entrée trop loin", "callback_data": f"nd_{trade_id}_entree_loin"}],
+            [{"text": "📊 Spread trop large", "callback_data": f"nd_{trade_id}_spread"}],
+            [{"text": "🔄 Renversement avant déclenchement", "callback_data": f"nd_{trade_id}_renversement"}],
+            [{"text": "⏰ Expiré / Weekend", "callback_data": f"nd_{trade_id}_expire"}],
+            [{"text": "❓ Autre raison", "callback_data": f"nd_{trade_id}_autre"}],
+        ]})
+        send_tg(chat_id, "⏭️ <b>Ordre non déclenché</b>\nQuelle est la raison ?")
+
+    # ── RAISON NON DÉCLENCHÉ ─────────────────────────────────────
+    elif callback_data.startswith("nd_"):
+        parts = callback_data.split("_")
+        trade_id = parts[1]
+        raison_code = "_".join(parts[2:])
+        raisons = {
+            "entree_loin": "Point d'entrée trop loin du prix",
+            "spread": "Spread trop large — prix entre BID/ASK",
+            "renversement": "Renversement avant déclenchement",
+            "expire": "Ordre expiré / Weekend",
+            "autre": "Autre raison"
+        }
+        raison_txt = raisons.get(raison_code, raison_code)
+        fb = pending_feedback.get(trade_id, {})
+        fb["raison_sortie"] = raison_txt
+        fb["step"] = "nondeclenche_direction"
+        pending_feedback[trade_id] = fb
+        answer_callback(callback_id, "Raison notée")
+        edit_tg_markup(chat_id, message_id, {"inline_keyboard": [
+            [{"text": "✅ Direction correcte", "callback_data": f"ndd_{trade_id}_oui"}],
+            [{"text": "❌ Direction incorrecte", "callback_data": f"ndd_{trade_id}_non"}],
+        ]})
+        send_tg(chat_id, f"Raison : <i>{raison_txt}</i>\n\nLa direction du système était-elle correcte ?")
+
+    # ── DIRECTION NON DÉCLENCHÉ ───────────────────────────────────
+    elif callback_data.startswith("ndd_"):
+        parts = callback_data.split("_")
+        trade_id = parts[1]
+        direction_ok = parts[2]
+        fb = pending_feedback.get(trade_id, {})
+        raison_txt = fb.get("raison_sortie", "")
+        dir_label = "✅ correcte" if direction_ok == "oui" else "❌ incorrecte"
+        try:
+            conn = get_db()
+            c = conn.cursor()
+            c.execute("""UPDATE journal SET resultat='nondeclenche',
+                direction_ok=%s, raison_sortie=%s,
+                commentaire=%s WHERE id=%s""",
+                (direction_ok, raison_txt,
+                 f"Ordre non déclenché — {raison_txt}", int(trade_id)))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Erreur nondeclenche: {e}")
+        answer_callback(callback_id, "Journalisé !")
+        edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+        send_tg(chat_id,
+            f"<b>⏭️ Trade #{trade_id} — NON DÉCLENCHÉ</b>\n"
+            f"Raison : <i>{raison_txt}</i>\n"
+            f"Direction système : {dir_label}\n\n"
+            f"💬 Ajoute un commentaire ou appuie sur Passer.",
+            {"inline_keyboard": [[{"text": "⏭️ Passer", "callback_data": f"skip_comment_{trade_id}"}]]})
+        fb["step"] = "commentaire"
+        pending_feedback[trade_id] = fb
 
     # ── SKIP COMMENTAIRE ─────────────────────────────────────
     elif callback_data.startswith("skip_comment_"):
@@ -582,6 +658,14 @@ def get_journal_context():
 
         c.execute(f"SELECT COUNT(*) as n FROM journal WHERE {FILTRE} AND resultat='win'")
         wins = c.fetchone()["n"]
+
+        # Stats ordres non déclenchés (apprentissage direction)
+        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat='nondeclenche'")
+        total_nd = c.fetchone()["n"]
+        if total_nd > 0:
+            c.execute("""SELECT COUNT(*) as n FROM journal
+                WHERE resultat='nondeclenche' AND direction_ok='oui'""")
+            nd_correct = c.fetchone()["n"]
         c.execute(f"SELECT COUNT(*) as n FROM journal WHERE {FILTRE} AND resultat='loss'")
         losses = c.fetchone()["n"]
         winrate = round(wins/total_done*100) if total_done > 0 else 0
@@ -632,6 +716,13 @@ def get_journal_context():
         ctx += "N<5 = donnee insuffisante = ne pas ajuster. "
         ctx += "Winrate < 40% et N>=5 = reduire score -2pts. "
         ctx += "Winrate > 65% et N>=5 = bonus +2pts. "
+
+        # Ajouter stats ordres non déclenchés
+        if total_nd > 0:
+            pct_nd = round(nd_correct/total_nd*100)
+            ctx += f"\nORDRES NON DÉCLENCHÉS ({total_nd} ordres) : "
+            ctx += f"Direction correcte {pct_nd}% des fois. "
+            ctx += "Ces ordres n'ont pas été exécutés mais la direction système était correcte dans la majorité des cas. "
 
         # Stats qualité
         c.execute(f"""SELECT
