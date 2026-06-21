@@ -265,7 +265,27 @@ def telegram_webhook():
                     ]]
                 })
 
-    # ── RESULTAT ─────────────────────────────────────────────
+    # ── NON DÉCLENCHÉ — DOIT ÊTRE AVANT LE HANDLER r_ GÉNÉRIQUE ──
+    elif callback_data.startswith("r_") and callback_data.endswith("_nondeclenche"):
+        parts = callback_data.split("_")
+        trade_id = parts[1]
+        fb = pending_feedback.get(trade_id, {})
+        fb["resultat"] = "nondeclenche"
+        fb["step"] = "nondeclenche_raison"
+        pending_feedback[trade_id] = fb
+        answer_callback(callback_id, "Ordre non déclenché")
+        edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+        send_tg(chat_id, "⏭️ <b>Ordre non déclenché</b>\nQuelle est la raison ?", {
+            "inline_keyboard": [
+                [{"text": "📍 Point d'entrée trop loin", "callback_data": f"nd_{trade_id}_entree_loin"}],
+                [{"text": "📊 Spread trop large",        "callback_data": f"nd_{trade_id}_spread"}],
+                [{"text": "🔄 Renversement avant déclenchement", "callback_data": f"nd_{trade_id}_renversement"}],
+                [{"text": "⏰ Expiré / Weekend",         "callback_data": f"nd_{trade_id}_expire"}],
+                [{"text": "❓ Autre raison",              "callback_data": f"nd_{trade_id}_autre"}],
+            ]
+        })
+
+    # ── RESULTAT (WIN / LOSS / BE) ────────────────────────────
     elif callback_data.startswith("r_"):
         parts = callback_data.split("_")
         if len(parts) == 3:
@@ -328,7 +348,6 @@ def telegram_webhook():
                 print(f"Erreur update journal: {e}")
             answer_callback(callback_id, "Presque fini !")
             edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
-            # Passer à l'étape commentaire
             fb["resultat"] = resultat
             fb["contexte"] = contexte
             fb["difficulte"] = difficulte
@@ -338,24 +357,7 @@ def telegram_webhook():
                 f"{label_d} noté.\n\n<b>💬 Commentaire sur ce trade ?</b>\nTape ton analyse, ce que tu as vu, pourquoi tu as pris ou raté ce trade.\n\nOu appuie sur Passer pour terminer.",
                 {"inline_keyboard": [[{"text": "⏭️ Passer", "callback_data": f"skip_comment_{trade_id}"}]]})
 
-    # ── NON DÉCLENCHÉ ────────────────────────────────────────────
-    elif callback_data.startswith("r_") and "_nondeclenche" in callback_data:
-        trade_id = callback_data.split("_")[1]
-        fb = pending_feedback.get(trade_id, {})
-        fb["resultat"] = "nondeclenche"
-        fb["step"] = "nondeclenche_raison"
-        pending_feedback[trade_id] = fb
-        answer_callback(callback_id, "Ordre non déclenché")
-        edit_tg_markup(chat_id, message_id, {"inline_keyboard": [
-            [{"text": "📍 Point d'entrée trop loin", "callback_data": f"nd_{trade_id}_entree_loin"}],
-            [{"text": "📊 Spread trop large", "callback_data": f"nd_{trade_id}_spread"}],
-            [{"text": "🔄 Renversement avant déclenchement", "callback_data": f"nd_{trade_id}_renversement"}],
-            [{"text": "⏰ Expiré / Weekend", "callback_data": f"nd_{trade_id}_expire"}],
-            [{"text": "❓ Autre raison", "callback_data": f"nd_{trade_id}_autre"}],
-        ]})
-        send_tg(chat_id, "⏭️ <b>Ordre non déclenché</b>\nQuelle est la raison ?")
-
-    # ── RAISON NON DÉCLENCHÉ ─────────────────────────────────────
+    # ── RAISON NON DÉCLENCHÉ ─────────────────────────────────
     elif callback_data.startswith("nd_"):
         parts = callback_data.split("_")
         trade_id = parts[1]
@@ -373,13 +375,15 @@ def telegram_webhook():
         fb["step"] = "nondeclenche_direction"
         pending_feedback[trade_id] = fb
         answer_callback(callback_id, "Raison notée")
-        edit_tg_markup(chat_id, message_id, {"inline_keyboard": [
-            [{"text": "✅ Direction correcte", "callback_data": f"ndd_{trade_id}_oui"}],
-            [{"text": "❌ Direction incorrecte", "callback_data": f"ndd_{trade_id}_non"}],
-        ]})
-        send_tg(chat_id, f"Raison : <i>{raison_txt}</i>\n\nLa direction du système était-elle correcte ?")
+        edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+        send_tg(chat_id, f"Raison : <i>{raison_txt}</i>\n\nLa direction du système était-elle correcte ?", {
+            "inline_keyboard": [
+                [{"text": "✅ Direction correcte",   "callback_data": f"ndd_{trade_id}_oui"}],
+                [{"text": "❌ Direction incorrecte", "callback_data": f"ndd_{trade_id}_non"}],
+            ]
+        })
 
-    # ── DIRECTION NON DÉCLENCHÉ ───────────────────────────────────
+    # ── DIRECTION NON DÉCLENCHÉ ───────────────────────────────
     elif callback_data.startswith("ndd_"):
         parts = callback_data.split("_")
         trade_id = parts[1]
@@ -427,11 +431,6 @@ def telegram_webhook():
 
     return jsonify({"ok": True})
 
-# ── MESSAGES TEXTE LIBRES (commentaires journal) ──────────────
-# Le webhook reçoit aussi les messages texte (pas seulement les callbacks)
-# On gère ça dans la même route en vérifiant "message" au lieu de "callback_query"
-# Note: la route /webhook/telegram gère les deux cas via le même endpoint
-
 @app.route("/admin/reset-journal", methods=["GET"])
 def reset_journal():
     secret = request.args.get("key","")
@@ -440,7 +439,6 @@ def reset_journal():
     try:
         conn = get_db()
         c = conn.cursor()
-        # Garder uniquement les trades d'aujourd'hui (19/06/2026)
         c.execute("DELETE FROM journal WHERE created_at NOT LIKE '2026-06-19%'")
         deleted = c.rowcount
         conn.commit()
@@ -643,7 +641,6 @@ def get_journal_context():
         c = conn.cursor()
 
         # FILTRE STRICT : uniquement les trades réellement pris
-        # Exclure : décision ATTENDRE auto, trades sans résultat, opportunités manquées
         FILTRE = """
             resultat IN ('win','loss','be')
             AND (commentaire NOT LIKE '%%opportunite_manquee%%' OR commentaire IS NULL)
@@ -662,10 +659,12 @@ def get_journal_context():
         # Stats ordres non déclenchés (apprentissage direction)
         c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat='nondeclenche'")
         total_nd = c.fetchone()["n"]
+        nd_correct = 0
         if total_nd > 0:
             c.execute("""SELECT COUNT(*) as n FROM journal
                 WHERE resultat='nondeclenche' AND direction_ok='oui'""")
             nd_correct = c.fetchone()["n"]
+
         c.execute(f"SELECT COUNT(*) as n FROM journal WHERE {FILTRE} AND resultat='loss'")
         losses = c.fetchone()["n"]
         winrate = round(wins/total_done*100) if total_done > 0 else 0
@@ -717,7 +716,7 @@ def get_journal_context():
         ctx += "Winrate < 40% et N>=5 = reduire score -2pts. "
         ctx += "Winrate > 65% et N>=5 = bonus +2pts. "
 
-        # Ajouter stats ordres non déclenchés
+        # Stats ordres non déclenchés
         if total_nd > 0:
             pct_nd = round(nd_correct/total_nd*100)
             ctx += f"\nORDRES NON DÉCLENCHÉS ({total_nd} ordres) : "
@@ -738,13 +737,12 @@ def get_journal_context():
             if qualite['ny_trap']: ctx += f"NY Trap={qualite['ny_trap']} fois. "
             ctx += "BE force = bon trade mal gere, ne pas penaliser la direction."
 
-        # Ajouter les news macro si disponibles
-        if redis_client:
+        # News macro depuis Redis
+        if r:
             try:
-                news = redis_client.get("macro_news")
+                news = r.get("macro_news")
                 if news:
-                    news_txt = news.decode('utf-8') if isinstance(news, bytes) else news
-                    ctx += f"\n{news_txt}"
+                    ctx += f"\n{news}"
             except:
                 pass
 
@@ -777,9 +775,9 @@ def scheduler_job():
 def fetch_macro_news():
     """Récupère les news macro depuis Alpha Vantage"""
     try:
-        url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&topics=forex,economy_macro,financial_markets&sort=LATEST&limit=10&apikey=UCP44WUC4UHAJ2I8"
-        r = requests.get(url, timeout=10)
-        data = r.json()
+        url = "https://www.alphavantage.co/query?function=NEWS_SENTIMENT&topics=forex,economy_macro,financial_markets&sort=LATEST&limit=10&apikey=UCP44WUC4UHAJ2I8"
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
         feed = data.get("feed", [])
         if not feed:
             return ""
@@ -788,8 +786,8 @@ def fetch_macro_news():
             title = item.get("title","")
             sentiment = item.get("overall_sentiment_label","neutral")
             summary += f"- {title} [{sentiment}]\n"
-        if redis_client:
-            redis_client.setex("macro_news", 43200, summary)
+        if r:
+            r.setex("macro_news", 43200, summary)
         print(f"News macro: {len(feed)} articles")
         return summary
     except Exception as e:
@@ -798,7 +796,6 @@ def fetch_macro_news():
 
 def trigger_analysis(session):
     try:
-        # Récupérer les news macro et les envoyer sur Telegram
         news = fetch_macro_news()
         msg = f"<b>Trading Master V5 — {session}</b>\nAnalyse automatique declenchee."
         if news:
