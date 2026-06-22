@@ -4,8 +4,7 @@ import requests
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from datetime import datetime
-import pytz
+from datetime import datetime, timezone
 import threading
 import time
 import redis
@@ -234,11 +233,16 @@ def telegram_webhook():
                 edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
                 pending_feedback[trade_id] = {"step":"resultat","chat_id":chat_id,"message_id":message_id}
                 send_tg(chat_id, "⚡ Override ATTENDRE — trade pris.\n\nRésultat du trade ?", {
-                    "inline_keyboard": [[
-                        {"text": "✅ WIN",  "callback_data": f"r_{trade_id}_win"},
-                        {"text": "❌ LOSS", "callback_data": f"r_{trade_id}_loss"},
-                        {"text": "➖ BE",   "callback_data": f"r_{trade_id}_be"}
-                    ]]
+                    "inline_keyboard": [
+                        [
+                            {"text": "✅ WIN",  "callback_data": f"r_{trade_id}_win"},
+                            {"text": "❌ LOSS", "callback_data": f"r_{trade_id}_loss"},
+                            {"text": "➖ BE",   "callback_data": f"r_{trade_id}_be"}
+                        ],
+                        [
+                            {"text": "⏭️ NON DÉCLENCHÉ", "callback_data": f"r_{trade_id}_nondeclenche"}
+                        ]
+                    ]
                 })
 
     # ── FTMO OVERRIDE ────────────────────────────────────────
@@ -754,18 +758,19 @@ def get_journal_context():
 
 # ── SCHEDULER ─────────────────────────────────────────────────
 def scheduler_job():
-    paris_tz = pytz.timezone('Europe/Paris')
     analyzed_today = {'london': None, 'ny': None}
     while True:
         try:
-            now = datetime.now(paris_tz)
+            now = datetime.now(timezone.utc)
             h, m, day = now.hour, now.minute, now.weekday()
             today = now.strftime('%Y-%m-%d')
             if day < 5:
-                if h == 7 and m == 0 and analyzed_today['london'] != today:
+                # London Open = 6h00 UTC (8h Paris été)
+                if h == 6 and m == 0 and analyzed_today['london'] != today:
                     analyzed_today['london'] = today
                     trigger_analysis('London Open')
-                if h == 13 and m == 30 and analyzed_today['ny'] != today:
+                # NY Open = 12h30 UTC (14h30 Paris été)
+                if h == 12 and m == 30 and analyzed_today['ny'] != today:
                     analyzed_today['ny'] = today
                     trigger_analysis('NY Open')
         except Exception as e:
