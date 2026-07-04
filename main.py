@@ -4,11 +4,23 @@ import requests
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from datetime import datetime, timezone
+from datetime import datetime
+import pytz
 import threading
 import time
 import redis
 import json
+
+# ══════════════════════════════════════════════════════════════
+# TRADING MASTER V5 — BACKEND v2
+# Nouveautes :
+#   1. GEL WEEK-END : /market-status + drapeau market_open sur les donnees
+#   2. ETIQUETTE DE FRAICHEUR : received_ts + age_seconds + stale sur les donnees
+#   3. BUG REPARE : redis_client -> r (les news macro et le contexte journal
+#      etaient silencieusement casses par un NameError)
+#   4. BUG REPARE : le bouton NON DECLENCHE etait inatteignable (avale par r_)
+#   5. Scheduler aligne sur la discipline : 08h00 et 14h30 heure de Paris
+# ══════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
 CORS(app, origins="*")
@@ -19,6 +31,15 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_KEY")
 REDIS_URL        = os.environ.get("REDIS_URL", "redis://red-d8j855mq1p3s73ff62ig:6379")
 DATABASE_URL     = os.environ.get("DATABASE_URL")
+
+PARIS_TZ = pytz.timezone('Europe/Paris')
+
+# Les cryptos vivent 24/7 (source Binance) — tout le reste suit les horaires forex
+CRYPTO_SYMBOLS = {"BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "BNBUSD", "ADAUSD"}
+
+# Au-dela de cet age (en secondes), une donnee est consideree perimee
+# quand le marche est ouvert (10 minutes)
+STALE_AFTER_SECONDS = 600
 
 # ── REDIS ─────────────────────────────────────────────────────
 try:
@@ -52,6 +73,53 @@ def redis_get(key):
         except: pass
     return None
 
+# ── GEL WEEK-END + FRAICHEUR (helpers) ───────────────────────
+def is_crypto(symbol):
+    return symbol.upper().replace("/", "") in CRYPTO_SYMBOLS
+
+def forex_market_open(now=None):
+    """Le forex ferme vendredi 23h (Paris) et rouvre dimanche 23h (Paris)."""
+    now = now or datetime.now(PARIS_TZ)
+    wd = now.weekday()  # lundi=0 ... dimanche=6
+    if wd == 5:
+        return False                      # samedi : ferme toute la journee
+    if wd == 4 and now.hour >= 23:
+        return False                      # vendredi apres 23h
+    if wd == 6 and now.hour < 23:
+        return False                      # dimanche avant 23h
+    return True
+
+def market_open_for(symbol):
+    """Crypto = toujours ouvert. Le reste = horaires forex."""
+    if is_crypto(symbol):
+        return True
+    return forex_market_open()
+
+def stamp(data):
+    """Ajoute l'heure de reception (etiquette de fraicheur) sur une donnee recue."""
+    data["received_ts"] = time.time()
+    data["received_at"] = datetime.now(PARIS_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return data
+
+def enrich(data, symbol):
+    """Ajoute age, fraicheur et etat du marche sur une donnee renvoyee."""
+    out = dict(data)
+    opened = market_open_for(symbol)
+    out["market_open"] = opened
+    ts = out.get("received_ts")
+    if ts:
+        age = int(time.time() - ts)
+        out["age_seconds"] = age
+        # Une donnee n'est "perimee" que si le marche est ouvert
+        # (le week-end, il est normal que les donnees soient figees)
+        out["stale"] = bool(opened and age > STALE_AFTER_SECONDS)
+    else:
+        out["age_seconds"] = None
+        out["stale"] = None
+    if not opened:
+        out["market_notice"] = "MARCHE FERME — donnees figees (week-end forex). Reouverture dimanche 23h Paris."
+    return out
+
 # ── POSTGRESQL ────────────────────────────────────────────────
 def get_db():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
@@ -71,7 +139,7 @@ def init_db():
             raison_sortie TEXT
         )''')
         # Ajouter colonnes si elles n'existent pas (migration)
-        for col in ['direction_ok','entree_ok','sortie_ok','raison_sortie']:
+        for col in ['direction_ok','entree_ok','sortie_ok','raison_sortie','systeme_suivi']:
             try:
                 c.execute(f"ALTER TABLE journal ADD COLUMN {col} TEXT")
             except: pass
@@ -102,7 +170,32 @@ def answer_callback(callback_id, text="OK"):
 @app.route("/")
 def home():
     redis_status = "OK" if r else "RAM fallback"
-    return f"Trading Master V5 Backend OK — Redis: {redis_status} — DB: PostgreSQL"
+    forex = "OUVERT" if forex_market_open() else "FERME (week-end)"
+    return f"Trading Master V5 Backend OK — Redis: {redis_status} — DB: PostgreSQL — Forex: {forex}"
+
+# ── ETAT DU MARCHE (pour l'interface et l'Enqueteur) ─────────
+@app.route("/market-status", methods=["GET"])
+def market_status():
+    now = datetime.now(PARIS_TZ)
+    opened = forex_market_open(now)
+    return jsonify({
+        "forex_open": opened,
+        "crypto_open": True,
+        "now_paris": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "weekday": now.weekday(),
+        "notice": None if opened else "Marche forex FERME — seules les cryptos sont analysables. Reouverture dimanche 23h Paris."
+    })
+
+@app.route("/market-status/<symbol>", methods=["GET"])
+def market_status_symbol(symbol):
+    key = symbol.upper().replace("/", "")
+    opened = market_open_for(key)
+    return jsonify({
+        "symbol": key,
+        "is_crypto": is_crypto(key),
+        "market_open": opened,
+        "now_paris": datetime.now(PARIS_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    })
 
 # ── TELEGRAM ──────────────────────────────────────────────────
 @app.route("/telegram", methods=["POST"])
@@ -233,16 +326,11 @@ def telegram_webhook():
                 edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
                 pending_feedback[trade_id] = {"step":"resultat","chat_id":chat_id,"message_id":message_id}
                 send_tg(chat_id, "⚡ Override ATTENDRE — trade pris.\n\nRésultat du trade ?", {
-                    "inline_keyboard": [
-                        [
-                            {"text": "✅ WIN",  "callback_data": f"r_{trade_id}_win"},
-                            {"text": "❌ LOSS", "callback_data": f"r_{trade_id}_loss"},
-                            {"text": "➖ BE",   "callback_data": f"r_{trade_id}_be"}
-                        ],
-                        [
-                            {"text": "⏭️ NON DÉCLENCHÉ", "callback_data": f"r_{trade_id}_nondeclenche"}
-                        ]
-                    ]
+                    "inline_keyboard": [[
+                        {"text": "✅ WIN",  "callback_data": f"r_{trade_id}_win"},
+                        {"text": "❌ LOSS", "callback_data": f"r_{trade_id}_loss"},
+                        {"text": "➖ BE",   "callback_data": f"r_{trade_id}_be"}
+                    ]]
                 })
 
     # ── FTMO OVERRIDE ────────────────────────────────────────
@@ -269,43 +357,41 @@ def telegram_webhook():
                     ]]
                 })
 
-    # ── NON DÉCLENCHÉ — DOIT ÊTRE AVANT LE HANDLER r_ GÉNÉRIQUE ──
-    elif callback_data.startswith("r_") and callback_data.endswith("_nondeclenche"):
-        parts = callback_data.split("_")
-        trade_id = parts[1]
-        fb = pending_feedback.get(trade_id, {})
-        fb["resultat"] = "nondeclenche"
-        fb["step"] = "nondeclenche_raison"
-        pending_feedback[trade_id] = fb
-        answer_callback(callback_id, "Ordre non déclenché")
-        edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
-        send_tg(chat_id, "⏭️ <b>Ordre non déclenché</b>\nQuelle est la raison ?", {
-            "inline_keyboard": [
-                [{"text": "📍 Point d'entrée trop loin", "callback_data": f"nd_{trade_id}_entree_loin"}],
-                [{"text": "📊 Spread trop large",        "callback_data": f"nd_{trade_id}_spread"}],
-                [{"text": "🔄 Renversement avant déclenchement", "callback_data": f"nd_{trade_id}_renversement"}],
-                [{"text": "⏰ Expiré / Weekend",         "callback_data": f"nd_{trade_id}_expire"}],
-                [{"text": "❓ Autre raison",              "callback_data": f"nd_{trade_id}_autre"}],
-            ]
-        })
-
-    # ── RESULTAT (WIN / LOSS / BE) ────────────────────────────
+    # ── RESULTAT (WIN / LOSS / BE / NON DECLENCHE) ───────────
+    # FIX : le cas "nondeclenche" est traite ICI, dans la premiere branche r_
+    # (avant, il etait dans un elif plus bas qui ne pouvait jamais etre atteint)
     elif callback_data.startswith("r_"):
         parts = callback_data.split("_")
         if len(parts) == 3:
             trade_id = parts[1]
             resultat = parts[2]
-            label = {"win":"✅ WIN","loss":"❌ LOSS","be":"➖ BE"}.get(resultat, resultat)
-            pending_feedback[trade_id] = {"step":"contexte","resultat":resultat,"chat_id":chat_id,"message_id":message_id}
-            answer_callback(callback_id, f"{label} noté !")
-            edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
-            send_tg(chat_id, f"{label} enregistré.\n\n<b>Type de marché ?</b>", {
-                "inline_keyboard": [[
-                    {"text": "📈 TREND",        "callback_data": f"c_{trade_id}_trend"},
-                    {"text": "📦 RANGE",        "callback_data": f"c_{trade_id}_range"},
-                    {"text": "🪤 MANIPULATION", "callback_data": f"c_{trade_id}_manipulation"}
-                ]]
-            })
+
+            if resultat == "nondeclenche":
+                fb = pending_feedback.get(trade_id, {})
+                fb["resultat"] = "nondeclenche"
+                fb["step"] = "nondeclenche_raison"
+                pending_feedback[trade_id] = fb
+                answer_callback(callback_id, "Ordre non déclenché")
+                edit_tg_markup(chat_id, message_id, {"inline_keyboard": [
+                    [{"text": "📍 Point d'entrée trop loin", "callback_data": f"nd_{trade_id}_entree_loin"}],
+                    [{"text": "📊 Spread trop large", "callback_data": f"nd_{trade_id}_spread"}],
+                    [{"text": "🔄 Renversement avant déclenchement", "callback_data": f"nd_{trade_id}_renversement"}],
+                    [{"text": "⏰ Expiré / Weekend", "callback_data": f"nd_{trade_id}_expire"}],
+                    [{"text": "❓ Autre raison", "callback_data": f"nd_{trade_id}_autre"}],
+                ]})
+                send_tg(chat_id, "⏭️ <b>Ordre non déclenché</b>\nQuelle est la raison ?")
+            else:
+                label = {"win":"✅ WIN","loss":"❌ LOSS","be":"➖ BE"}.get(resultat, resultat)
+                pending_feedback[trade_id] = {"step":"contexte","resultat":resultat,"chat_id":chat_id,"message_id":message_id}
+                answer_callback(callback_id, f"{label} noté !")
+                edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+                send_tg(chat_id, f"{label} enregistré.\n\n<b>Type de marché ?</b>", {
+                    "inline_keyboard": [[
+                        {"text": "📈 TREND",        "callback_data": f"c_{trade_id}_trend"},
+                        {"text": "📦 RANGE",        "callback_data": f"c_{trade_id}_range"},
+                        {"text": "🪤 MANIPULATION", "callback_data": f"c_{trade_id}_manipulation"}
+                    ]]
+                })
 
     # ── CONTEXTE MARCHE ──────────────────────────────────────
     elif callback_data.startswith("c_"):
@@ -352,16 +438,46 @@ def telegram_webhook():
                 print(f"Erreur update journal: {e}")
             answer_callback(callback_id, "Presque fini !")
             edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+            # Passer à l'étape commentaire
             fb["resultat"] = resultat
             fb["contexte"] = contexte
             fb["difficulte"] = difficulte
-            fb["step"] = "commentaire"
+            fb["step"] = "systeme"
             pending_feedback[trade_id] = fb
             send_tg(chat_id,
-                f"{label_d} noté.\n\n<b>💬 Commentaire sur ce trade ?</b>\nTape ton analyse, ce que tu as vu, pourquoi tu as pris ou raté ce trade.\n\nOu appuie sur Passer pour terminer.",
+                f"{label_d} noté.\n\n<b>🦊 Système suivi ?</b>\nEntrée au signal, SL/TP du plan, zéro main ?",
+                {"inline_keyboard": [[
+                    {"text": "✅ OUI — plan respecté", "callback_data": f"s_{trade_id}_oui"},
+                    {"text": "❌ NON — hors système",  "callback_data": f"s_{trade_id}_non"}
+                ]]})
+
+    # ── SYSTEME SUIVI ? (discipline) ─────────────────────────
+    elif callback_data.startswith("s_"):
+        parts = callback_data.split("_")
+        if len(parts) == 3:
+            trade_id = parts[1]
+            suivi    = parts[2]  # oui / non
+            label_s = "✅ Plan respecté" if suivi == "oui" else "❌ Hors système"
+            try:
+                conn = get_db()
+                c = conn.cursor()
+                c.execute("UPDATE journal SET systeme_suivi=%s WHERE id=%s",
+                    (suivi, int(trade_id)))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                print(f"Erreur systeme_suivi: {e}")
+            fb = pending_feedback.get(trade_id, {})
+            fb["systeme_suivi"] = suivi
+            fb["step"] = "commentaire"
+            pending_feedback[trade_id] = fb
+            answer_callback(callback_id, label_s)
+            edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+            send_tg(chat_id,
+                f"{label_s} noté.\n\n<b>💬 Commentaire sur ce trade ?</b>\nTape ton analyse, ce que tu as vu, pourquoi tu as pris ou raté ce trade.\n\nOu appuie sur Passer pour terminer.",
                 {"inline_keyboard": [[{"text": "⏭️ Passer", "callback_data": f"skip_comment_{trade_id}"}]]})
 
-    # ── RAISON NON DÉCLENCHÉ ─────────────────────────────────
+    # ── RAISON NON DÉCLENCHÉ ─────────────────────────────────────
     elif callback_data.startswith("nd_"):
         parts = callback_data.split("_")
         trade_id = parts[1]
@@ -379,15 +495,13 @@ def telegram_webhook():
         fb["step"] = "nondeclenche_direction"
         pending_feedback[trade_id] = fb
         answer_callback(callback_id, "Raison notée")
-        edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
-        send_tg(chat_id, f"Raison : <i>{raison_txt}</i>\n\nLa direction du système était-elle correcte ?", {
-            "inline_keyboard": [
-                [{"text": "✅ Direction correcte",   "callback_data": f"ndd_{trade_id}_oui"}],
-                [{"text": "❌ Direction incorrecte", "callback_data": f"ndd_{trade_id}_non"}],
-            ]
-        })
+        edit_tg_markup(chat_id, message_id, {"inline_keyboard": [
+            [{"text": "✅ Direction correcte", "callback_data": f"ndd_{trade_id}_oui"}],
+            [{"text": "❌ Direction incorrecte", "callback_data": f"ndd_{trade_id}_non"}],
+        ]})
+        send_tg(chat_id, f"Raison : <i>{raison_txt}</i>\n\nLa direction du système était-elle correcte ?")
 
-    # ── DIRECTION NON DÉCLENCHÉ ───────────────────────────────
+    # ── DIRECTION NON DÉCLENCHÉ ───────────────────────────────────
     elif callback_data.startswith("ndd_"):
         parts = callback_data.split("_")
         trade_id = parts[1]
@@ -443,6 +557,7 @@ def reset_journal():
     try:
         conn = get_db()
         c = conn.cursor()
+        # Garder uniquement les trades d'aujourd'hui (19/06/2026)
         c.execute("DELETE FROM journal WHERE created_at NOT LIKE '2026-06-19%'")
         deleted = c.rowcount
         conn.commit()
@@ -473,6 +588,7 @@ def receive_price():
     data = request.get_json(force=True, silent=True)
     if not data: return jsonify({"error": "JSON invalide"}), 400
     symbol = data.get("symbol","").upper().replace("/","")
+    data = stamp(data)
     if not redis_set(f"price:{symbol}", data): mt4_prices_ram[symbol] = data
     return jsonify({"success": True})
 
@@ -480,8 +596,8 @@ def receive_price():
 def get_price(symbol):
     key = symbol.upper().replace("/","")
     data = redis_get(f"price:{key}") or mt4_prices_ram.get(key)
-    if data: return jsonify(data)
-    return jsonify({"error": "Prix non disponible"}), 404
+    if data: return jsonify(enrich(data, key))
+    return jsonify({"error": "Prix non disponible", "market_open": market_open_for(key)}), 404
 
 # ── BOUGIES H1 ────────────────────────────────────────────────
 @app.route("/candles", methods=["POST"])
@@ -489,6 +605,7 @@ def receive_candles():
     data = request.get_json(force=True, silent=True)
     if not data: return jsonify({"error": "JSON invalide"}), 400
     symbol = data.get("symbol","").upper().replace("/","")
+    data = stamp(data)
     if not redis_set(f"candles:{symbol}", data): mt4_candles_ram[symbol] = data
     print(f"Bougies H1: {symbol} — {len(data.get('candles',[]))} bougies")
     return jsonify({"success": True})
@@ -497,8 +614,8 @@ def receive_candles():
 def get_candles(symbol):
     key = symbol.upper().replace("/","")
     data = redis_get(f"candles:{key}") or mt4_candles_ram.get(key)
-    if data: return jsonify(data)
-    return jsonify({"error": "Bougies non disponibles"}), 404
+    if data: return jsonify(enrich(data, key))
+    return jsonify({"error": "Bougies non disponibles", "market_open": market_open_for(key)}), 404
 
 # ── BOUGIES M15 ───────────────────────────────────────────────
 @app.route("/m15", methods=["POST"])
@@ -509,6 +626,7 @@ def receive_m15():
         print(f"M15 JSON echec: {raw[:200]}")
         return jsonify({"error": "JSON invalide"}), 400
     symbol = data.get("symbol","").upper().replace("/","")
+    data = stamp(data)
     if not redis_set(f"m15:{symbol}", data): mt4_m15_ram[symbol] = data
     print(f"Bougies M15: {symbol} — {len(data.get('candles',[]))} bougies")
     return jsonify({"success": True})
@@ -517,8 +635,8 @@ def receive_m15():
 def get_m15(symbol):
     key = symbol.upper().replace("/","")
     data = redis_get(f"m15:{key}") or mt4_m15_ram.get(key)
-    if data: return jsonify(data)
-    return jsonify({"error": "Bougies M15 non disponibles"}), 404
+    if data: return jsonify(enrich(data, key))
+    return jsonify({"error": "Bougies M15 non disponibles", "market_open": market_open_for(key)}), 404
 
 # ── BOUGIES DAILY ─────────────────────────────────────────────
 @app.route("/daily", methods=["POST"])
@@ -526,6 +644,7 @@ def receive_daily():
     data = request.get_json(force=True, silent=True)
     if not data: return jsonify({"error": "JSON invalide"}), 400
     symbol = data.get("symbol","").upper().replace("/","")
+    data = stamp(data)
     if not redis_set(f"daily:{symbol}", data): mt4_daily_ram[symbol] = data
     print(f"Daily: {symbol} — {len(data.get('candles',[]))} bougies")
     return jsonify({"success": True})
@@ -534,8 +653,8 @@ def receive_daily():
 def get_daily(symbol):
     key = symbol.upper().replace("/","")
     data = redis_get(f"daily:{key}") or mt4_daily_ram.get(key)
-    if data: return jsonify(data)
-    return jsonify({"error": "Daily non disponible"}), 404
+    if data: return jsonify(enrich(data, key))
+    return jsonify({"error": "Daily non disponible", "market_open": market_open_for(key)}), 404
 
 # ── SCREENSHOT ────────────────────────────────────────────────
 @app.route("/screenshot", methods=["POST"])
@@ -628,6 +747,9 @@ def get_stats():
             c.execute("SELECT COUNT(*) as n FROM journal WHERE contexte_marche=%s", (ctx,)); total_ctx = c.fetchone()["n"]
             c.execute("SELECT COUNT(*) as n FROM journal WHERE contexte_marche=%s AND resultat='win'", (ctx,)); wins_ctx = c.fetchone()["n"]
             stats[f"ctx_{ctx}"] = {"total":total_ctx,"wins":wins_ctx,"winrate":round(wins_ctx/total_ctx*100) if total_ctx>0 else 0}
+        c.execute("SELECT COUNT(*) as n, COALESCE(SUM(pnl),0) as p FROM journal WHERE systeme_suivi='non' AND resultat IN ('win','loss','be')")
+        row = c.fetchone()
+        stats["hors_systeme"] = {"total": row["n"], "pnl": round(row["p"], 2)}
         for diff in ["easy","medium","hard"]:
             c.execute("SELECT COUNT(*) as n FROM journal WHERE difficulte=%s", (diff,)); total_d = c.fetchone()["n"]
             c.execute("SELECT COUNT(*) as n FROM journal WHERE difficulte=%s AND resultat='win'", (diff,)); wins_d = c.fetchone()["n"]
@@ -645,8 +767,14 @@ def get_journal_context():
         c = conn.cursor()
 
         # FILTRE STRICT : uniquement les trades réellement pris
+        # Exclure : décision ATTENDRE auto, trades sans résultat, opportunités manquées
+        # L'agent Memoire n'apprend QUE des trades ou le plan a ete respecte
+        # (systeme_suivi='oui'). Les anciens trades sans etiquette (NULL) restent
+        # comptes pour ne pas effacer l'historique. Les trades 'non' (hors systeme)
+        # sont journalises mais jugent la discipline du trader, pas le systeme.
         FILTRE = """
             resultat IN ('win','loss','be')
+            AND (systeme_suivi = 'oui' OR systeme_suivi IS NULL)
             AND (commentaire NOT LIKE '%%opportunite_manquee%%' OR commentaire IS NULL)
             AND (commentaire NOT LIKE '%%TRADE NON PRIS%%' OR commentaire IS NULL)
         """
@@ -661,14 +789,13 @@ def get_journal_context():
         wins = c.fetchone()["n"]
 
         # Stats ordres non déclenchés (apprentissage direction)
+        nd_correct = 0
         c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat='nondeclenche'")
         total_nd = c.fetchone()["n"]
-        nd_correct = 0
         if total_nd > 0:
             c.execute("""SELECT COUNT(*) as n FROM journal
                 WHERE resultat='nondeclenche' AND direction_ok='oui'""")
             nd_correct = c.fetchone()["n"]
-
         c.execute(f"SELECT COUNT(*) as n FROM journal WHERE {FILTRE} AND resultat='loss'")
         losses = c.fetchone()["n"]
         winrate = round(wins/total_done*100) if total_done > 0 else 0
@@ -720,7 +847,7 @@ def get_journal_context():
         ctx += "Winrate < 40% et N>=5 = reduire score -2pts. "
         ctx += "Winrate > 65% et N>=5 = bonus +2pts. "
 
-        # Stats ordres non déclenchés
+        # Ajouter stats ordres non déclenchés
         if total_nd > 0:
             pct_nd = round(nd_correct/total_nd*100)
             ctx += f"\nORDRES NON DÉCLENCHÉS ({total_nd} ordres) : "
@@ -741,12 +868,32 @@ def get_journal_context():
             if qualite['ny_trap']: ctx += f"NY Trap={qualite['ny_trap']} fois. "
             ctx += "BE force = bon trade mal gere, ne pas penaliser la direction."
 
-        # News macro depuis Redis
+        # ── DISCIPLINE : trades hors systeme (non comptes ci-dessus) ──
+        c.execute("""SELECT COUNT(*) as n, COALESCE(SUM(pnl),0) as p
+            FROM journal WHERE systeme_suivi='non' AND resultat IN ('win','loss','be')""")
+        indis = c.fetchone()
+        if indis and indis['n'] > 0:
+            ctx += f"\nDISCIPLINE : {indis['n']} trades HORS SYSTEME exclus des stats "
+            ctx += f"ci-dessus (PnL cumule : {round(indis['p'],2)} EUR). "
+            ctx += "Ces trades jugent le trader, pas le systeme — ne pas en tenir compte dans le score."
+
+        # ── ETAT DU MARCHE (gel week-end pour les agents) ─────
+        if not forex_market_open():
+            ctx += "\n\nMARCHE FERME : Nous sommes le week-end. Le forex, les metaux, "
+            ctx += "les indices et les petroles sont FERMES — leurs donnees sont figees "
+            ctx += "depuis vendredi 23h Paris. AUCUN signal ne doit etre emis sur ces "
+            ctx += "instruments. Seules les cryptos (donnees Binance) sont analysables. "
+            ctx += "Reouverture dimanche 23h Paris."
+
+        # Ajouter les news macro si disponibles
+        # FIX : c'etait "redis_client" (variable inexistante) -> NameError silencieux
+        # qui vidait tout le contexte journal. Corrige en "r".
         if r:
             try:
                 news = r.get("macro_news")
                 if news:
-                    ctx += f"\n{news}"
+                    news_txt = news.decode('utf-8') if isinstance(news, bytes) else news
+                    ctx += f"\n{news_txt}"
             except:
                 pass
 
@@ -758,19 +905,19 @@ def get_journal_context():
 
 # ── SCHEDULER ─────────────────────────────────────────────────
 def scheduler_job():
+    # Aligne sur la discipline de trading :
+    # 08h00 Paris = London Open · 14h30 Paris = NY Open · jamais le week-end
     analyzed_today = {'london': None, 'ny': None}
     while True:
         try:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(PARIS_TZ)
             h, m, day = now.hour, now.minute, now.weekday()
             today = now.strftime('%Y-%m-%d')
             if day < 5:
-                # London Open = 6h00 UTC (8h Paris été)
-                if h == 6 and m == 0 and analyzed_today['london'] != today:
+                if h == 8 and m == 0 and analyzed_today['london'] != today:
                     analyzed_today['london'] = today
                     trigger_analysis('London Open')
-                # NY Open = 12h30 UTC (14h30 Paris été)
-                if h == 12 and m == 30 and analyzed_today['ny'] != today:
+                if h == 14 and m == 30 and analyzed_today['ny'] != today:
                     analyzed_today['ny'] = today
                     trigger_analysis('NY Open')
         except Exception as e:
@@ -780,7 +927,7 @@ def scheduler_job():
 def fetch_macro_news():
     """Récupère les news macro depuis Alpha Vantage"""
     try:
-        url = "https://www.alphavantage.co/query?function=NEWS_SENTIMENT&topics=forex,economy_macro,financial_markets&sort=LATEST&limit=10&apikey=UCP44WUC4UHAJ2I8"
+        url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&topics=forex,economy_macro,financial_markets&sort=LATEST&limit=10&apikey=UCP44WUC4UHAJ2I8"
         resp = requests.get(url, timeout=10)
         data = resp.json()
         feed = data.get("feed", [])
@@ -791,8 +938,12 @@ def fetch_macro_news():
             title = item.get("title","")
             sentiment = item.get("overall_sentiment_label","neutral")
             summary += f"- {title} [{sentiment}]\n"
+        # FIX : c'etait "redis_client" (variable inexistante) — les news
+        # n'etaient jamais sauvegardees. Corrige en "r".
         if r:
-            r.setex("macro_news", 43200, summary)
+            try:
+                r.setex("macro_news", 43200, summary)
+            except: pass
         print(f"News macro: {len(feed)} articles")
         return summary
     except Exception as e:
@@ -801,6 +952,7 @@ def fetch_macro_news():
 
 def trigger_analysis(session):
     try:
+        # Récupérer les news macro et les envoyer sur Telegram
         news = fetch_macro_news()
         msg = f"<b>Trading Master V5 — {session}</b>\nAnalyse automatique declenchee."
         if news:
