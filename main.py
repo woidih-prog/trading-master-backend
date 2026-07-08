@@ -10,9 +10,10 @@ import threading
 import time
 import redis
 import json
+import math
 
 # ══════════════════════════════════════════════════════════════
-# TRADING MASTER V5 — BACKEND v2
+# TRADING MASTER V5 — BACKEND v4
 # Nouveautes :
 #   1. GEL WEEK-END : /market-status + drapeau market_open sur les donnees
 #   2. ETIQUETTE DE FRAICHEUR : received_ts + age_seconds + stale sur les donnees
@@ -20,6 +21,8 @@ import json
 #      etaient silencieusement casses par un NameError)
 #   4. BUG REPARE : le bouton NON DECLENCHE etait inatteignable (avale par r_)
 #   5. Scheduler aligne sur la discipline : 08h00 et 14h30 heure de Paris
+#   6. v4 : CALCUL DE TAILLE DE LOT (/lot-size) — le risque 1% devient reel
+#      + garde-fou distance minimale du stop par instrument
 # ══════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
@@ -184,6 +187,101 @@ def market_status():
         "now_paris": now.strftime("%Y-%m-%d %H:%M:%S"),
         "weekday": now.weekday(),
         "notice": None if opened else "Marche forex FERME — seules les cryptos sont analysables. Reouverture dimanche 23h Paris."
+    })
+
+# ── TAILLE DE LOT (securite v4) ───────────────────────────────
+# Le systeme affichait "Risque 1%" mais laissait le trader mettre 1 lot fixe.
+# Resultat : risque reel entre 0,3% et 3% selon l'instrument (cas Or : -893 EUR).
+# Cette route calcule la taille exacte : risque EUR / (distance SL x taille contrat / taux EUR)
+
+CONTRACT_SIZES = {
+    "GOLD": 100, "SILVER": 5000,          # onces par lot (Admiral)
+    "BRENT": 100, "CRUDOIL": 100,          # barils par lot
+    "US100": 1, "[SP500]": 1, "[DJI30]": 1,
+    "GERMANY40": 1, "[FTSE100]": 1         # indices : 1 point = ~1 unite (a verifier)
+}
+QUOTE_OVERRIDES = {
+    "GOLD": "USD", "SILVER": "USD", "BRENT": "USD", "CRUDOIL": "USD",
+    "US100": "USD", "[SP500]": "USD", "[DJI30]": "USD",
+    "GERMANY40": "EUR", "[FTSE100]": "GBP"
+}
+FALLBACK_EUR = {"USD": 1.14, "JPY": 184.5, "CAD": 1.62, "CHF": 0.92, "GBP": 0.856, "EUR": 1.0}
+
+# Distance minimale du stop par instrument (garde-fou anti "0,2 pip")
+MIN_STOP_DIST = {
+    "GOLD": 3.0, "SILVER": 0.30, "BRENT": 0.30, "CRUDOIL": 0.30,
+    "US100": 15.0, "[SP500]": 8.0, "[DJI30]": 30.0, "GERMANY40": 15.0, "[FTSE100]": 10.0
+}
+
+def eur_rate(quote):
+    """Combien de 'quote' pour 1 EUR — via les prix live MT4, sinon taux de secours."""
+    if quote == "EUR":
+        return 1.0
+    d = redis_get(f"price:EUR{quote}") or mt4_prices_ram.get("EUR" + quote)
+    if d and d.get("bid"):
+        try:
+            v = float(d["bid"])
+            if v > 0:
+                return v
+        except Exception:
+            pass
+    return FALLBACK_EUR.get(quote, 1.0)
+
+@app.route("/lot-size", methods=["GET"])
+def lot_size():
+    symbol = request.args.get("symbol", "").upper().replace("/", "")
+    try:
+        entry = float(request.args.get("entry"))
+        sl = float(request.args.get("sl"))
+    except Exception:
+        return jsonify({"error": "Parametres entry et sl requis (nombres)"}), 400
+    try:
+        balance = float(request.args.get("balance", os.environ.get("ACCOUNT_BALANCE", "92000")))
+        risk_pct = float(request.args.get("risk_pct", "1"))
+    except Exception:
+        balance, risk_pct = 92000.0, 1.0
+
+    dist = abs(entry - sl)
+    if dist <= 0:
+        return jsonify({"error": "SL identique a l'entree"}), 400
+
+    contract = CONTRACT_SIZES.get(symbol, 100000)  # forex standard : 100 000 unites
+    quote = QUOTE_OVERRIDES.get(symbol, symbol[-3:] if len(symbol) >= 6 else "USD")
+    rate = eur_rate(quote)
+
+    risk_per_lot_quote = dist * contract          # perte au SL pour 1 lot, en devise de cotation
+    risk_per_lot_eur = risk_per_lot_quote / rate if rate > 0 else risk_per_lot_quote
+    target_risk_eur = balance * risk_pct / 100.0
+
+    lots = target_risk_eur / risk_per_lot_eur if risk_per_lot_eur > 0 else 0
+    lots = math.floor(lots * 100) / 100.0          # arrondi vers le bas, pas de sur-risque
+    warning = None
+    if lots < 0.01:
+        lots = 0.01
+        warning = "Stop tres large : meme 0.01 lot depasse le risque cible"
+    if lots > 5:
+        lots = 5.0
+        warning = "Taille plafonnee a 5 lots par securite"
+    if symbol in ("US100", "[SP500]", "[DJI30]", "GERMANY40", "[FTSE100]"):
+        warning = "Indice : valeur du point a verifier chez Admiral — lot indicatif"
+
+    # Garde-fou : distance minimale du stop
+    is_jpy = symbol.endswith("JPY")
+    min_stop = MIN_STOP_DIST.get(symbol, 0.15 if is_jpy else 0.0015)
+    stop_ok = dist >= min_stop
+
+    risk_real_eur = round(lots * risk_per_lot_eur, 2)
+    return jsonify({
+        "symbol": symbol,
+        "lots": lots,
+        "risk_eur": risk_real_eur,
+        "risk_pct_reel": round(risk_real_eur / balance * 100, 2) if balance > 0 else None,
+        "distance_sl": round(dist, 5),
+        "stop_ok": stop_ok,
+        "min_stop": min_stop,
+        "stop_warning": None if stop_ok else f"STOP TROP SERRE : {round(dist,5)} < minimum {min_stop} pour {symbol} — niveaux a recalculer",
+        "warning": warning,
+        "balance_utilisee": balance
     })
 
 @app.route("/market-status/<symbol>", methods=["GET"])
