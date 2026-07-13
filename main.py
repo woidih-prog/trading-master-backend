@@ -13,7 +13,7 @@ import json
 import math
 
 # ══════════════════════════════════════════════════════════════
-# TRADING MASTER V5 — BACKEND v4
+# TRADING MASTER V5 — BACKEND v5
 # Nouveautes :
 #   1. GEL WEEK-END : /market-status + drapeau market_open sur les donnees
 #   2. ETIQUETTE DE FRAICHEUR : received_ts + age_seconds + stale sur les donnees
@@ -23,6 +23,8 @@ import math
 #   5. Scheduler aligne sur la discipline : 08h00 et 14h30 heure de Paris
 #   6. v4 : CALCUL DE TAILLE DE LOT (/lot-size) — le risque 1% devient reel
 #      + garde-fou distance minimale du stop par instrument
+#   7. v5 : tailles de contrat CRYPTO ajoutees (le BTC etait calcule comme
+#      du forex 100 000 unites -> chiffres absurdes). BTC/ETH = 1 unite/lot.
 # ══════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
@@ -198,19 +200,27 @@ CONTRACT_SIZES = {
     "GOLD": 100, "SILVER": 5000,          # onces par lot (Admiral)
     "BRENT": 100, "CRUDOIL": 100,          # barils par lot
     "US100": 1, "[SP500]": 1, "[DJI30]": 1,
-    "GERMANY40": 1, "[FTSE100]": 1         # indices : 1 point = ~1 unite (a verifier)
+    "GERMANY40": 1, "[FTSE100]": 1,        # indices : 1 point = ~1 unite (a verifier)
+    # Cryptos (CFD Admiral : 1 lot = 1 unite pour BTC/ETH)
+    "BTCUSD": 1, "ETHUSD": 1,
+    # Cryptos hors MT4 (Binance, non executables sur le compte) : indicatif
+    "SOLUSD": 1, "BNBUSD": 1, "XRPUSD": 1000, "ADAUSD": 1000
 }
 QUOTE_OVERRIDES = {
     "GOLD": "USD", "SILVER": "USD", "BRENT": "USD", "CRUDOIL": "USD",
     "US100": "USD", "[SP500]": "USD", "[DJI30]": "USD",
-    "GERMANY40": "EUR", "[FTSE100]": "GBP"
+    "GERMANY40": "EUR", "[FTSE100]": "GBP",
+    "BTCUSD": "USD", "ETHUSD": "USD", "SOLUSD": "USD",
+    "BNBUSD": "USD", "XRPUSD": "USD", "ADAUSD": "USD"
 }
 FALLBACK_EUR = {"USD": 1.14, "JPY": 184.5, "CAD": 1.62, "CHF": 0.92, "GBP": 0.856, "EUR": 1.0}
 
 # Distance minimale du stop par instrument (garde-fou anti "0,2 pip")
 MIN_STOP_DIST = {
     "GOLD": 3.0, "SILVER": 0.30, "BRENT": 0.30, "CRUDOIL": 0.30,
-    "US100": 15.0, "[SP500]": 8.0, "[DJI30]": 30.0, "GERMANY40": 15.0, "[FTSE100]": 10.0
+    "US100": 15.0, "[SP500]": 8.0, "[DJI30]": 30.0, "GERMANY40": 15.0, "[FTSE100]": 10.0,
+    "BTCUSD": 300.0, "ETHUSD": 15.0, "SOLUSD": 1.5,
+    "BNBUSD": 5.0, "XRPUSD": 0.02, "ADAUSD": 0.01
 }
 
 def eur_rate(quote):
@@ -264,6 +274,8 @@ def lot_size():
         warning = "Taille plafonnee a 5 lots par securite"
     if symbol in ("US100", "[SP500]", "[DJI30]", "GERMANY40", "[FTSE100]"):
         warning = "Indice : valeur du point a verifier chez Admiral — lot indicatif"
+    if symbol in ("SOLUSD", "BNBUSD", "XRPUSD", "ADAUSD"):
+        warning = "Crypto hors MT4 (source Binance) — non executable sur le compte demo, taille indicative"
 
     # Garde-fou : distance minimale du stop
     is_jpy = symbol.endswith("JPY")
