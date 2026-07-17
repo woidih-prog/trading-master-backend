@@ -4,7 +4,7 @@ import requests
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from datetime import datetime
+from datetime import datetime, timezone
 import pytz
 import threading
 import time
@@ -13,7 +13,7 @@ import json
 import math
 
 # ══════════════════════════════════════════════════════════════
-# TRADING MASTER V5 — BACKEND v5
+# TRADING MASTER V5 — BACKEND v6
 # Nouveautes :
 #   1. GEL WEEK-END : /market-status + drapeau market_open sur les donnees
 #   2. ETIQUETTE DE FRAICHEUR : received_ts + age_seconds + stale sur les donnees
@@ -190,6 +190,65 @@ def market_status():
         "weekday": now.weekday(),
         "notice": None if opened else "Marche forex FERME — seules les cryptos sont analysables. Reouverture dimanche 23h Paris."
     })
+
+# ── SOMMET DES TRADES (mesure trailing, v6) ───────────────────
+# Le robot envoie, pour chaque trade ferme, le profit MAX atteint (en R) et le
+# resultat final. On accumule ces donnees pour decider du reglage du trailing.
+TRADE_PEAKS = []  # en memoire ; persiste aussi dans un fichier simple
+
+def _load_peaks():
+    global TRADE_PEAKS
+    try:
+        if os.path.exists("/tmp/trade_peaks.json"):
+            with open("/tmp/trade_peaks.json") as f:
+                TRADE_PEAKS = json.load(f)
+    except Exception:
+        TRADE_PEAKS = []
+
+def _save_peaks():
+    try:
+        with open("/tmp/trade_peaks.json", "w") as f:
+            json.dump(TRADE_PEAKS[-500:], f)  # garder les 500 derniers
+    except Exception:
+        pass
+
+_load_peaks()
+
+@app.route("/trade-peak", methods=["POST"])
+def trade_peak():
+    try:
+        d = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"error": "json invalide"}), 400
+    entry = {
+        "ticket": d.get("ticket"),
+        "symbol": d.get("symbol", ""),
+        "peak_r": d.get("peak_r", 0),
+        "profit_final": d.get("profit_final", 0),
+        "ts": datetime.now(timezone.utc).isoformat()
+    }
+    TRADE_PEAKS.append(entry)
+    _save_peaks()
+    return jsonify({"ok": True, "recorded": entry})
+
+@app.route("/trade-peaks", methods=["GET"])
+def trade_peaks_list():
+    """Renvoie les donnees de sommet + une petite synthese pour decider du trailing."""
+    peaks = [p for p in TRADE_PEAKS if p.get("peak_r") is not None]
+    n = len(peaks)
+    synthese = {}
+    if n > 0:
+        pr = [float(p["peak_r"]) for p in peaks]
+        # combien de trades ont atteint au moins 1R, 1.5R, 2R
+        synthese = {
+            "nb_trades": n,
+            "sommet_moyen_R": round(sum(pr) / n, 2),
+            "ont_atteint_1R_pct": round(100 * sum(1 for x in pr if x >= 1.0) / n),
+            "ont_atteint_1_5R_pct": round(100 * sum(1 for x in pr if x >= 1.5) / n),
+            "ont_atteint_2R_pct": round(100 * sum(1 for x in pr if x >= 2.0) / n),
+            "ont_atteint_3R_pct": round(100 * sum(1 for x in pr if x >= 3.0) / n),
+        }
+    return jsonify({"synthese": synthese, "trades": peaks[-100:]})
 
 # ── TAILLE DE LOT (securite v4) ───────────────────────────────
 # Le systeme affichait "Risque 1%" mais laissait le trader mettre 1 lot fixe.
