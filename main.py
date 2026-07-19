@@ -919,7 +919,15 @@ def get_stats():
         c.execute("SELECT SUM(pnl) as s FROM journal WHERE pnl IS NOT NULL"); stats["total_pnl"] = round(c.fetchone()["s"] or 0, 2)
         c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat IS NOT NULL AND resultat!=''")
         done = c.fetchone()["n"]
-        stats["winrate"] = round(stats["wins"]/done*100) if done > 0 else 0
+        # FIX WINRATE : le winrate ne doit compter QUE les trades reellement pris
+        # (win + loss + be). Avant, 'done' incluait aussi les 'nondeclenche', 'passe',
+        # etc., ce qui gonflait le denominateur et ecrasait le winrate (ex: 12% au lieu du vrai).
+        trades_pris = stats["wins"] + stats["losses"] + stats["be"]
+        stats["trades_pris"] = trades_pris
+        stats["winrate"] = round(stats["wins"]/trades_pris*100) if trades_pris > 0 else 0
+        # Compter les non-declenches a part (info utile, pas dans le winrate)
+        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat='nondeclenche'")
+        stats["non_declenches"] = c.fetchone()["n"]
         for ctx in ["trend","range","manipulation"]:
             c.execute("SELECT COUNT(*) as n FROM journal WHERE contexte_marche=%s", (ctx,)); total_ctx = c.fetchone()["n"]
             c.execute("SELECT COUNT(*) as n FROM journal WHERE contexte_marche=%s AND resultat='win'", (ctx,)); wins_ctx = c.fetchone()["n"]
