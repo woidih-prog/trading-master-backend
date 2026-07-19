@@ -143,12 +143,20 @@ def init_db():
             direction_ok TEXT, entree_ok TEXT, sortie_ok TEXT,
             raison_sortie TEXT
         )''')
-        # Ajouter colonnes si elles n'existent pas (migration)
+        conn.commit()
+        # Ajouter colonnes si elles n'existent pas (migration).
+        # FIX : sur PostgreSQL, une seule ALTER qui echoue (colonne deja existante)
+        # met TOUTE la transaction en erreur et bloque les colonnes suivantes.
+        # Solution : "ADD COLUMN IF NOT EXISTS" + un commit par colonne, avec
+        # rollback en cas d'echec pour repartir sur une transaction propre.
         for col in ['direction_ok','entree_ok','sortie_ok','raison_sortie','systeme_suivi']:
             try:
-                c.execute(f"ALTER TABLE journal ADD COLUMN {col} TEXT")
-            except: pass
-        conn.commit()
+                c.execute(f"ALTER TABLE journal ADD COLUMN IF NOT EXISTS {col} TEXT")
+                conn.commit()
+                print(f"Colonne verifiee/ajoutee : {col}")
+            except Exception as e:
+                conn.rollback()
+                print(f"Colonne {col} : {e}")
         conn.close()
         print("PostgreSQL connecte OK")
     except Exception as e:
