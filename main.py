@@ -1065,6 +1065,15 @@ def get_journal_context():
 
         ctx = f"HISTORIQUE TRADES REELS ({total_done} trades pris) :\n"
         ctx += f"- Winrate global : {winrate}% ({wins} wins / {losses} pertes)\n"
+        ctx += ("REGLE D'USAGE DE CES STATISTIQUES (obligatoire pour TOUS les agents) :\n"
+                "1) Ces stats servent a COMPRENDRE le contexte des pertes passees "
+                "(ex: pertes concentrees en RANGE ou sans TRAP confirme), PAS a punir "
+                "mecaniquement une paire ou une session.\n"
+                "2) SEUL l'Agent Memoire applique un bonus/malus historique (max ±1pt). "
+                "Les AUTRES agents (Liquidite, Structure, Zones, Timing, Risk, Backtest, Eco) "
+                "ne doivent appliquer AUCUN malus base sur ces winrates historiques — "
+                "ils analysent le marche ACTUEL uniquement. Tout double-comptage fausse le score.\n"
+                "3) Une stat sur N<10 trades est une indication, pas une loi.\n")
 
         if pairs_stats:
             ctx += "- Performance par paire :\n"
@@ -1078,6 +1087,9 @@ def get_journal_context():
             for m in marche_stats:
                 wr = round(m['wins']/m['total']*100) if m['total'] > 0 else 0
                 ctx += f"  {m['contexte_marche'].upper()} : {wr}% sur {m['total']} trades\n"
+            ctx += ("  LECTURE : c'est le TYPE DE MARCHE qui explique les pertes, pas la paire. "
+                    "Si RANGE affiche un winrate tres bas, la lecon est : eviter les entrees "
+                    "directionnelles en range — pas eviter telle paire ou telle session.\n")
 
         if session_stats:
             ctx += "- Performance par session :\n"
