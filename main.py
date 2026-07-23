@@ -1,554 +1,1222 @@
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TM V5 — Admin Dashboard</title>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap');
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import requests
+import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from datetime import datetime, timezone
+import pytz
+import threading
+import time
+import redis
+import json
+import math
 
-:root{
-  --gold:#FFD700;--silver:#C0C0C0;--green:#00C853;--red:#ff4444;--orange:#FFA500;
-  --bg:#050a05;--bg2:#0a120a;--bg3:#0d180d;--border:#1a2e1a;
-  --text:#e8e8e8;--muted:#4a6a4a;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--text);font-family:'Syne',sans-serif;min-height:100vh;
-  background-image:radial-gradient(ellipse 80% 50% at 50% -10%,#0d2a0d,transparent),
-  repeating-linear-gradient(0deg,transparent,transparent 40px,#0d180d22 40px,#0d180d22 41px),
-  repeating-linear-gradient(90deg,transparent,transparent 40px,#0d180d22 40px,#0d180d22 41px);}
+# ══════════════════════════════════════════════════════════════
+# TRADING MASTER V5 — BACKEND v6
+# Nouveautes :
+#   1. GEL WEEK-END : /market-status + drapeau market_open sur les donnees
+#   2. ETIQUETTE DE FRAICHEUR : received_ts + age_seconds + stale sur les donnees
+#   3. BUG REPARE : redis_client -> r (les news macro et le contexte journal
+#      etaient silencieusement casses par un NameError)
+#   4. BUG REPARE : le bouton NON DECLENCHE etait inatteignable (avale par r_)
+#   5. Scheduler aligne sur la discipline : 08h00 et 14h30 heure de Paris
+#   6. v4 : CALCUL DE TAILLE DE LOT (/lot-size) — le risque 1% devient reel
+#      + garde-fou distance minimale du stop par instrument
+#   7. v5 : tailles de contrat CRYPTO ajoutees (le BTC etait calcule comme
+#      du forex 100 000 unites -> chiffres absurdes). BTC/ETH = 1 unite/lot.
+# ══════════════════════════════════════════════════════════════
 
-/* HEADER */
-.header{padding:24px 32px;display:flex;align-items:center;justify-content:space-between;
-  border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100;
-  background:rgba(5,10,5,0.95);backdrop-filter:blur(12px);}
-.logo-area{display:flex;align-items:center;gap:14px}
-.logo-icon{width:44px;height:44px;background:linear-gradient(135deg,var(--gold),var(--orange));
-  border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:20px;
-  box-shadow:0 0 20px #FFD70040}
-.logo-text{font-size:11px;font-weight:800;letter-spacing:4px;color:var(--gold);font-family:'Space Mono',monospace}
-.logo-sub{font-size:8px;color:var(--muted);letter-spacing:3px;margin-top:2px}
-.header-right{display:flex;align-items:center;gap:12px}
-.refresh-btn{background:var(--bg3);border:1px solid var(--border);color:var(--gold);
-  border-radius:8px;padding:8px 16px;font-size:10px;font-family:'Space Mono',monospace;
-  font-weight:700;cursor:pointer;letter-spacing:1px;transition:all .2s}
-.refresh-btn:hover{background:#FFD70015;border-color:var(--gold)}
-.last-update{font-size:9px;color:var(--muted);font-family:'Space Mono',monospace}
+app = Flask(__name__)
+CORS(app, origins="*")
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
-.container{max-width:1200px;margin:0 auto;padding:32px 24px}
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_KEY")
+REDIS_URL        = os.environ.get("REDIS_URL", "redis://red-d8j855mq1p3s73ff62ig:6379")
+DATABASE_URL     = os.environ.get("DATABASE_URL")
 
-/* SECTION TITLE */
-.section-title{font-size:9px;font-weight:700;letter-spacing:4px;color:var(--muted);
-  font-family:'Space Mono',monospace;margin-bottom:16px;text-transform:uppercase}
+PARIS_TZ = pytz.timezone('Europe/Paris')
 
-/* KPI GRID */
-.kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:32px}
-.kpi{background:var(--bg3);border:1px solid var(--border);border-radius:14px;padding:18px 20px;
-  position:relative;overflow:hidden;transition:border-color .2s}
-.kpi::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;border-radius:2px 2px 0 0}
-.kpi.gold::before{background:linear-gradient(90deg,transparent,var(--gold),transparent)}
-.kpi.green::before{background:linear-gradient(90deg,transparent,var(--green),transparent)}
-.kpi.red::before{background:linear-gradient(90deg,transparent,var(--red),transparent)}
-.kpi.silver::before{background:linear-gradient(90deg,transparent,var(--silver),transparent)}
-.kpi.orange::before{background:linear-gradient(90deg,transparent,var(--orange),transparent)}
-.kpi-label{font-size:8px;color:var(--muted);letter-spacing:2px;font-family:'Space Mono',monospace;margin-bottom:8px}
-.kpi-value{font-size:32px;font-weight:800;font-family:'Space Mono',monospace;line-height:1}
-.kpi-sub{font-size:9px;color:var(--muted);margin-top:6px;font-family:'Space Mono',monospace}
+# Les cryptos vivent 24/7 (source Binance) — tout le reste suit les horaires forex
+CRYPTO_SYMBOLS = {"BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "BNBUSD", "ADAUSD"}
 
-/* GRID 2 COL */
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px}
-.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:24px}
-@media(max-width:700px){.grid2,.grid3{grid-template-columns:1fr}}
+# Au-dela de cet age (en secondes), une donnee est consideree perimee
+# quand le marche est ouvert (10 minutes)
+STALE_AFTER_SECONDS = 600
 
-/* CARD */
-.card{background:var(--bg3);border:1px solid var(--border);border-radius:14px;padding:20px 22px}
-.card-title{font-size:9px;font-weight:700;letter-spacing:3px;color:var(--gold);
-  font-family:'Space Mono',monospace;margin-bottom:16px;text-transform:uppercase}
+# ── REDIS ─────────────────────────────────────────────────────
+def _connect_redis():
+    """Tente une connexion Redis. Renvoie l'objet connecte ou None."""
+    try:
+        conn = redis.from_url(REDIS_URL, decode_responses=True,
+                              socket_connect_timeout=3, socket_timeout=3)
+        conn.ping()
+        print("Redis connecte OK")
+        return conn
+    except Exception as e:
+        print(f"Redis erreur connexion: {e}")
+        return None
 
-/* PROGRESS BAR */
-.prog-row{display:flex;align-items:center;gap:10px;margin-bottom:10px}
-.prog-label{font-size:10px;color:var(--text);font-family:'Space Mono',monospace;min-width:90px}
-.prog-bar{flex:1;height:8px;background:#0a120a;border-radius:4px;overflow:hidden}
-.prog-fill{height:100%;border-radius:4px;transition:width 1s ease}
-.prog-val{font-size:10px;font-weight:700;font-family:'Space Mono',monospace;min-width:40px;text-align:right}
-.prog-count{font-size:9px;color:var(--muted);font-family:'Space Mono',monospace;min-width:30px;text-align:right}
+r = _connect_redis()
+_last_redis_retry = 0.0
 
-/* MATRICE */
-.matrix{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px}
-.matrix-header{font-size:8px;color:var(--muted);font-family:'Space Mono',monospace;
-  text-align:center;padding:6px 4px;letter-spacing:1px}
-.matrix-cell{border-radius:8px;padding:10px 6px;text-align:center;font-size:11px;
-  font-weight:700;font-family:'Space Mono',monospace;border:1px solid transparent}
-.matrix-label{font-size:9px;color:var(--muted);font-family:'Space Mono',monospace;
-  display:flex;align-items:center;justify-content:flex-end;padding-right:8px;font-weight:700}
+def _get_redis():
+    """Renvoie la connexion Redis, en RETENTANT la connexion toutes les 30s
+    si elle est tombee. FIX : avant, une connexion ratee au demarrage rendait
+    le serveur definitivement sans Redis (panne invisible, 404 partout)."""
+    global r, _last_redis_retry
+    if r is not None:
+        return r
+    now = time.time()
+    if now - _last_redis_retry >= 30:
+        _last_redis_retry = now
+        r = _connect_redis()
+    return r
 
-/* TABLE */
-.trade-table{width:100%;border-collapse:collapse;font-family:'Space Mono',monospace;font-size:9px}
-.trade-table th{color:var(--muted);letter-spacing:1px;padding:8px 10px;text-align:left;
-  border-bottom:1px solid var(--border);font-weight:400}
-.trade-table td{padding:9px 10px;border-bottom:1px solid #0d180d;vertical-align:middle}
-.trade-table tr:last-child td{border-bottom:none}
-.trade-table tr:hover td{background:#0d180d50}
+mt4_prices_ram  = {}
+mt4_candles_ram = {}
+mt4_m15_ram     = {}
+mt4_daily_ram   = {}
+mt4_screenshots_ram = {}
+pending_feedback = {}
 
-/* BADGES */
-.badge{border-radius:4px;padding:2px 8px;font-size:9px;font-family:'Space Mono',monospace;
-  font-weight:700;white-space:nowrap;display:inline-block}
-.badge-win{background:#00C85320;border:1px solid #00C85340;color:var(--green)}
-.badge-loss{background:#ff444420;border:1px solid #ff444440;color:var(--red)}
-.badge-be{background:#C0C0C020;border:1px solid #C0C0C040;color:var(--silver)}
-.badge-trend{background:#00d4ff15;border:1px solid #00d4ff30;color:#00d4ff}
-.badge-range{background:#FFD70015;border:1px solid #FFD70030;color:var(--gold)}
-.badge-manipulation{background:#e879f915;border:1px solid #e879f930;color:#e879f9}
-.badge-easy{background:#00C85315;border:1px solid #00C85330;color:var(--green)}
-.badge-medium{background:#FFA50015;border:1px solid #FFA50030;color:var(--orange)}
-.badge-hard{background:#ff444415;border:1px solid #ff444430;color:var(--red)}
+def redis_set(key, data):
+    global r
+    conn = _get_redis()
+    if conn:
+        try:
+            conn.set(key, json.dumps(data), ex=86400)
+            return True
+        except Exception as e:
+            print(f"Redis SET erreur ({key}): {e}")
+            r = None  # marquer la connexion comme tombee -> reconnexion auto
+    return False
 
-/* EVOLUTION CHART */
-.evo-chart{height:120px;position:relative;margin-top:8px}
-.evo-svg{width:100%;height:100%}
+def redis_get(key):
+    global r
+    conn = _get_redis()
+    if conn:
+        try:
+            val = conn.get(key)
+            if val: return json.loads(val)
+        except Exception as e:
+            print(f"Redis GET erreur ({key}): {e}")
+            r = None  # marquer la connexion comme tombee -> reconnexion auto
+    return None
 
-/* EMPTY STATE */
-.empty{text-align:center;padding:40px;color:var(--muted);font-family:'Space Mono',monospace;font-size:10px}
+# ── GEL WEEK-END + FRAICHEUR (helpers) ───────────────────────
+def is_crypto(symbol):
+    return symbol.upper().replace("/", "") in CRYPTO_SYMBOLS
 
-/* GATE STATS */
-.gate-row{display:flex;justify-content:space-between;align-items:center;
-  padding:10px 0;border-bottom:1px solid var(--border);font-family:'Space Mono',monospace}
-.gate-row:last-child{border-bottom:none}
-.gate-key{font-size:10px;color:var(--text)}
-.gate-val{font-size:12px;font-weight:700;color:var(--gold)}
+def forex_market_open(now=None):
+    """Le forex ferme vendredi 23h (Paris) et rouvre dimanche 23h (Paris)."""
+    now = now or datetime.now(PARIS_TZ)
+    wd = now.weekday()  # lundi=0 ... dimanche=6
+    if wd == 5:
+        return False                      # samedi : ferme toute la journee
+    if wd == 4 and now.hour >= 23:
+        return False                      # vendredi apres 23h
+    if wd == 6 and now.hour < 23:
+        return False                      # dimanche avant 23h
+    return True
 
-@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
-.card{animation:fadeIn .4s ease both}
-.kpi{animation:fadeIn .3s ease both}
-</style>
-</head>
-<body>
+def market_open_for(symbol):
+    """Crypto = toujours ouvert. Le reste = horaires forex."""
+    if is_crypto(symbol):
+        return True
+    return forex_market_open()
 
-<div class="header">
-  <div class="logo-area">
-    <div class="logo-icon">&#x1F4B0;</div>
-    <div>
-      <div class="logo-text">TRADING MASTER V5</div>
-      <div class="logo-sub">ADMIN DASHBOARD &mdash; ANALYSE SYSTEME</div>
-    </div>
-  </div>
-  <div class="header-right">
-    <span class="last-update" id="lastUpdate">--</span>
-    <button class="refresh-btn" onclick="loadAll()">&#x21BA; REFRESH</button>
-  </div>
-</div>
+def stamp(data):
+    """Ajoute l'heure de reception (etiquette de fraicheur) sur une donnee recue."""
+    data["received_ts"] = time.time()
+    data["received_at"] = datetime.now(PARIS_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return data
 
-<div class="container">
+def enrich(data, symbol):
+    """Ajoute age, fraicheur et etat du marche sur une donnee renvoyee."""
+    out = dict(data)
+    opened = market_open_for(symbol)
+    out["market_open"] = opened
+    ts = out.get("received_ts")
+    if ts:
+        age = int(time.time() - ts)
+        out["age_seconds"] = age
+        # Une donnee n'est "perimee" que si le marche est ouvert
+        # (le week-end, il est normal que les donnees soient figees)
+        out["stale"] = bool(opened and age > STALE_AFTER_SECONDS)
+    else:
+        out["age_seconds"] = None
+        out["stale"] = None
+    if not opened:
+        out["market_notice"] = "MARCHE FERME — donnees figees (week-end forex). Reouverture dimanche 23h Paris."
+    return out
 
-  <!-- KPI GLOBAUX -->
-  <div class="section-title">Performance globale</div>
-  <div class="kpi-grid" id="kpiGrid">
-    <div class="kpi gold"><div class="kpi-label">TRADES TOTAL</div><div class="kpi-value" id="kTotal">--</div><div class="kpi-sub">journalises</div></div>
-    <div class="kpi green"><div class="kpi-label">WINRATE</div><div class="kpi-value" id="kWinrate" style="color:var(--green)">--%</div><div class="kpi-sub" id="kWins">-- wins</div></div>
-    <div class="kpi red"><div class="kpi-label">LOSSES</div><div class="kpi-value" id="kLosses" style="color:var(--red)">--</div><div class="kpi-sub" id="kBe">-- BE</div></div>
-    <div class="kpi silver"><div class="kpi-label">P&amp;L CUMULE</div><div class="kpi-value" id="kPnl">--</div><div class="kpi-sub">euros</div></div>
-    <div class="kpi orange"><div class="kpi-label">TRADES RESTANTS</div><div class="kpi-value" id="kRestants" style="color:var(--orange)">--</div><div class="kpi-sub">objectif 20</div></div>
-  </div>
+# ── POSTGRESQL ────────────────────────────────────────────────
+def get_db():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
-  <!-- WINRATE PAR CONTEXTE + PAR DIFFICULTE -->
-  <div class="grid2">
-    <div class="card">
-      <div class="card-title">Winrate par type de marche</div>
-      <div id="ctxBars"><div class="empty">En attente de donnees...</div></div>
-    </div>
-    <div class="card">
-      <div class="card-title">Winrate par difficulte</div>
-      <div id="diffBars"><div class="empty">En attente de donnees...</div></div>
-    </div>
-  </div>
+def init_db():
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS journal (
+            id SERIAL PRIMARY KEY,
+            date TEXT, pair TEXT, tf TEXT, session TEXT,
+            score INTEGER, decision TEXT, bias TEXT,
+            entry TEXT, sl TEXT, tp TEXT, rr TEXT,
+            resultat TEXT, contexte_marche TEXT, difficulte TEXT,
+            pnl REAL, commentaire TEXT, created_at TEXT,
+            direction_ok TEXT, entree_ok TEXT, sortie_ok TEXT,
+            raison_sortie TEXT
+        )''')
+        conn.commit()
+        # Ajouter colonnes si elles n'existent pas (migration).
+        # FIX : sur PostgreSQL, une seule ALTER qui echoue (colonne deja existante)
+        # met TOUTE la transaction en erreur et bloque les colonnes suivantes.
+        # Solution : "ADD COLUMN IF NOT EXISTS" + un commit par colonne, avec
+        # rollback en cas d'echec pour repartir sur une transaction propre.
+        for col in ['direction_ok','entree_ok','sortie_ok','raison_sortie','systeme_suivi']:
+            try:
+                c.execute(f"ALTER TABLE journal ADD COLUMN IF NOT EXISTS {col} TEXT")
+                conn.commit()
+                print(f"Colonne verifiee/ajoutee : {col}")
+            except Exception as e:
+                conn.rollback()
+                print(f"Colonne {col} : {e}")
+        conn.close()
+        print("PostgreSQL connecte OK")
+    except Exception as e:
+        print(f"PostgreSQL erreur: {e}")
 
-  <!-- MATRICE CONTEXTE x DIFFICULTE -->
-  <div class="card" style="margin-bottom:24px">
-    <div class="card-title">Matrice Marche x Difficulte (winrate %)</div>
-    <div id="matrice"><div class="empty">En attente de donnees...</div></div>
-  </div>
+init_db()
 
-  <!-- EVOLUTION P&L + WINRATE GLISSANT -->
-  <div class="grid2">
-    <div class="card">
-      <div class="card-title">Evolution P&amp;L cumule</div>
-      <div class="evo-chart"><svg class="evo-svg" id="pnlChart"></svg></div>
-    </div>
-    <div class="card">
-      <div class="card-title">Winrate glissant (10 derniers trades)</div>
-      <div class="evo-chart"><svg class="evo-svg" id="wrChart"></svg></div>
-    </div>
-  </div>
+# ── HELPERS TELEGRAM ──────────────────────────────────────────
+def send_tg(chat_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    r2 = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload)
+    return r2.json()
 
-  <!-- STATS PAR PAIRE -->
-  <div class="card" style="margin-bottom:24px">
-    <div class="card-title">Performance par paire</div>
-    <div id="paireBars"><div class="empty">En attente de donnees...</div></div>
-  </div>
+def edit_tg_markup(chat_id, message_id, reply_markup):
+    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageReplyMarkup",
+        json={"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup})
 
-  <!-- JOURNAL RECENT -->
-  <div class="card" style="margin-bottom:24px">
-    <div class="card-title">20 derniers trades</div>
-    <div style="overflow-x:auto">
-      <table class="trade-table">
-        <thead>
-          <tr>
-            <th>#</th><th>DATE</th><th>PAIRE</th><th>TF</th>
-            <th>SCORE</th><th>DECISION</th><th>RESULTAT</th>
-            <th>MARCHE</th><th>DIFFICULTE</th><th>P&amp;L</th>
-          </tr>
-        </thead>
-        <tbody id="tradeBody"><tr><td colspan="10" class="empty">Chargement...</td></tr></tbody>
-      </table>
-    </div>
-  </div>
+def answer_callback(callback_id, text="OK"):
+    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+        json={"callback_query_id": callback_id, "text": text})
 
-  <!-- ============ TABLEAU DE SUIVI DES REGLES ============ -->
-  <div class="card" style="margin-top:22px">
-    <div class="card-title">SUIVI DES REGLES &mdash; IMPACT SUR LE WINRATE</div>
-    <p style="font-size:12px;color:var(--muted);margin:8px 0 14px;font-style:italic">
-      Chaque regle activee est mesuree : winrate des trades AVANT sa date vs APRES.
-      Rappel : ceci donne des INDICES, pas des preuves (le marche change aussi tout seul).
-    </p>
-    <div style="overflow-x:auto">
-      <table style="width:100%;border-collapse:collapse;font-size:12px">
-        <thead>
-          <tr style="text-align:left;color:var(--gold);border-bottom:1px solid var(--border)">
-            <th style="padding:8px 6px">REGLE</th>
-            <th style="padding:8px 6px">DATE</th>
-            <th style="padding:8px 6px">WR AVANT</th>
-            <th style="padding:8px 6px">WR APRES</th>
-            <th style="padding:8px 6px">TRADES AP.</th>
-            <th style="padding:8px 6px">IMPACT</th>
-          </tr>
-        </thead>
-        <tbody id="reglesBody">
-          <tr><td colspan="6" class="empty">Chargement...</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
+@app.route("/")
+def home():
+    redis_status = "OK" if r else "RAM fallback"
+    forex = "OUVERT" if forex_market_open() else "FERME (week-end)"
+    return f"Trading Master V5 Backend OK — Redis: {redis_status} — DB: PostgreSQL — Forex: {forex}"
 
-</div>
+# ── PAGE DE CONTROLE : etat de l'entrepot en un coup d'oeil ──
+@app.route("/debug", methods=["GET"])
+def debug_status():
+    """Ouvre cette page dans le navigateur pour voir l'etat du systeme :
+    Redis connecte ? Combien de bougies stockees ? Quelle fraicheur ?"""
+    out = {"heure_paris": datetime.now(PARIS_TZ).strftime("%Y-%m-%d %H:%M:%S")}
+    conn = _get_redis()
+    out["redis_connecte"] = bool(conn)
+    inventaire = {}
+    try:
+        if conn:
+            for prefix in ["price", "candles", "m15", "daily"]:
+                keys = conn.keys(f"{prefix}:*")
+                detail = {}
+                for k in sorted(keys):
+                    try:
+                        d = json.loads(conn.get(k) or "{}")
+                        ts = d.get("received_ts")
+                        detail[k.split(":",1)[1]] = (str(int(time.time()-ts))+"s" if ts else "?")
+                    except Exception:
+                        detail[k.split(":",1)[1]] = "illisible"
+                inventaire[prefix] = {"total": len(keys), "age_par_symbole": detail}
+        else:
+            for name, ram in [("price", mt4_prices_ram), ("candles", mt4_candles_ram),
+                              ("m15", mt4_m15_ram), ("daily", mt4_daily_ram)]:
+                inventaire[name] = {"total": len(ram), "source": "RAM (Redis tombe)"}
+    except Exception as e:
+        out["erreur_inventaire"] = str(e)
+    out["inventaire"] = inventaire
+    out["aide"] = "age_par_symbole = anciennete du dernier envoi recu. Normal: <120s marche ouvert. Si ca grossit sans fin, le robot n'envoie plus."
+    return jsonify(out)
 
-<script>
-const BACKEND = "https://trading-master-backend.onrender.com";
+# ── ETAT DU MARCHE (pour l'interface et l'Enqueteur) ─────────
+@app.route("/market-status", methods=["GET"])
+def market_status():
+    now = datetime.now(PARIS_TZ)
+    opened = forex_market_open(now)
+    return jsonify({
+        "forex_open": opened,
+        "crypto_open": True,
+        "now_paris": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "weekday": now.weekday(),
+        "notice": None if opened else "Marche forex FERME — seules les cryptos sont analysables. Reouverture dimanche 23h Paris."
+    })
 
-async function loadAll(){
-  document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('fr-FR');
-  try{
-    const [statsRes, tradesRes] = await Promise.all([
-      fetch(BACKEND+'/journal/stats'),
-      fetch(BACKEND+'/journal')
-    ]);
-    const stats  = await statsRes.json();
-    const trades = await tradesRes.json();
-    renderKPI(stats, trades);
-    renderCtxBars(stats);
-    renderDiffBars(stats);
-    renderMatrice(trades);
-    renderPaireBars(trades);
-    renderPnlChart(trades);
-    renderWrChart(trades);
-    renderTable(trades);
-    renderRegles(trades);
-  }catch(e){
-    console.error('Erreur chargement:', e);
-  }
-}
+# ── SOMMET DES TRADES (mesure trailing, v6) ───────────────────
+# Le robot envoie, pour chaque trade ferme, le profit MAX atteint (en R) et le
+# resultat final. On accumule ces donnees pour decider du reglage du trailing.
+TRADE_PEAKS = []  # en memoire ; persiste aussi dans un fichier simple
 
-function renderKPI(s, trades){
-  document.getElementById('kTotal').textContent   = s.total || 0;
-  const wr = s.winrate || 0;
-  document.getElementById('kWinrate').textContent = wr + '%';
-  document.getElementById('kWinrate').style.color = wr >= 50 ? 'var(--green)' : 'var(--red)';
-  document.getElementById('kWins').textContent    = (s.wins||0) + ' wins';
-  document.getElementById('kLosses').textContent  = s.losses || 0;
-  document.getElementById('kBe').textContent      = (s.be||0) + ' BE';
-  const pnl = s.total_pnl || 0;
-  document.getElementById('kPnl').textContent     = (pnl >= 0 ? '+' : '') + pnl;
-  document.getElementById('kPnl').style.color     = pnl >= 0 ? 'var(--green)' : 'var(--red)';
-  const restants = Math.max(0, 20 - (s.total||0));
-  document.getElementById('kRestants').textContent = restants;
-  document.getElementById('kRestants').style.color = restants === 0 ? 'var(--green)' : 'var(--orange)';
-}
+def _load_peaks():
+    global TRADE_PEAKS
+    try:
+        if os.path.exists("/tmp/trade_peaks.json"):
+            with open("/tmp/trade_peaks.json") as f:
+                TRADE_PEAKS = json.load(f)
+    except Exception:
+        TRADE_PEAKS = []
 
-function renderCtxBars(s){
-  const ctxs = [
-    {key:'trend',      label:'TREND',        color:'#00d4ff', icon:'📈'},
-    {key:'range',      label:'RANGE',        color:'#FFD700', icon:'📦'},
-    {key:'manipulation',label:'MANIP',       color:'#e879f9', icon:'🪤'},
-  ];
-  const el = document.getElementById('ctxBars');
-  if(!s.ctx_trend && !s.ctx_range && !s.ctx_manipulation){
-    el.innerHTML='<div class="empty">Pas encore de donnees de contexte</div>'; return;
-  }
-  el.innerHTML = ctxs.map(c => {
-    const d = s['ctx_'+c.key] || {total:0,wins:0,winrate:0};
-    return `<div class="prog-row">
-      <span class="prog-label">${c.icon} ${c.label}</span>
-      <div class="prog-bar"><div class="prog-fill" style="width:${d.winrate}%;background:${c.color}"></div></div>
-      <span class="prog-val" style="color:${c.color}">${d.winrate}%</span>
-      <span class="prog-count">${d.total}T</span>
-    </div>`;
-  }).join('');
-}
+def _save_peaks():
+    try:
+        with open("/tmp/trade_peaks.json", "w") as f:
+            json.dump(TRADE_PEAKS[-500:], f)  # garder les 500 derniers
+    except Exception:
+        pass
 
-function renderDiffBars(s){
-  const diffs = [
-    {key:'easy',   label:'EASY',   color:'var(--green)',  icon:'🟢'},
-    {key:'medium', label:'MEDIUM', color:'var(--orange)', icon:'🟡'},
-    {key:'hard',   label:'HARD',   color:'var(--red)',    icon:'🔴'},
-  ];
-  const el = document.getElementById('diffBars');
-  if(!s.diff_easy && !s.diff_medium && !s.diff_hard){
-    el.innerHTML='<div class="empty">Pas encore de donnees de difficulte</div>'; return;
-  }
-  el.innerHTML = diffs.map(d => {
-    const data = s['diff_'+d.key] || {total:0,wins:0,winrate:0};
-    return `<div class="prog-row">
-      <span class="prog-label">${d.icon} ${d.label}</span>
-      <div class="prog-bar"><div class="prog-fill" style="width:${data.winrate}%;background:${d.color}"></div></div>
-      <span class="prog-val" style="color:${d.color}">${data.winrate}%</span>
-      <span class="prog-count">${data.total}T</span>
-    </div>`;
-  }).join('');
-}
+_load_peaks()
 
-function renderMatrice(trades){
-  const el = document.getElementById('matrice');
-  const done = trades.filter(t => t.resultat && t.contexte_marche && t.difficulte);
-  if(done.length === 0){
-    el.innerHTML='<div class="empty">Pas encore de donnees combinées</div>'; return;
-  }
-
-  const ctxs = ['trend','range','manipulation'];
-  const diffs = ['easy','medium','hard'];
-  const ctxLabels = {'trend':'📈 TREND','range':'📦 RANGE','manipulation':'🪤 MANIP'};
-  const diffLabels = {'easy':'🟢 EASY','medium':'🟡 MEDIUM','hard':'🔴 HARD'};
-
-  // Calculer winrate pour chaque combinaison
-  function wr(ctx, diff){
-    const filtered = done.filter(t => t.contexte_marche === ctx && t.difficulte === diff);
-    if(!filtered.length) return null;
-    const wins = filtered.filter(t => t.resultat === 'win').length;
-    return {wr: Math.round(wins/filtered.length*100), n: filtered.length};
-  }
-
-  function cellColor(pct){
-    if(pct === null) return 'background:#0a120a;color:#2a4a2a;border-color:#1a2e1a';
-    if(pct >= 70) return `background:#00C85320;color:var(--green);border-color:#00C85340`;
-    if(pct >= 50) return `background:#FFD70020;color:var(--gold);border-color:#FFD70040`;
-    return `background:#ff444420;color:var(--red);border-color:#ff444440`;
-  }
-
-  let html = '<div class="matrix">';
-  html += '<div class="matrix-header"></div>';
-  diffs.forEach(d => html += `<div class="matrix-header">${diffLabels[d]}</div>`);
-
-  ctxs.forEach(ctx => {
-    html += `<div class="matrix-label">${ctxLabels[ctx]}</div>`;
-    diffs.forEach(diff => {
-      const data = wr(ctx, diff);
-      html += `<div class="matrix-cell" style="${cellColor(data ? data.wr : null)}">
-        ${data ? data.wr+'%<br><span style="font-size:8px;opacity:.7">${data.n}T</span>' : '--'}
-      </div>`;
-    });
-  });
-
-  html += '</div>';
-  el.innerHTML = html;
-}
-
-function renderPaireBars(trades){
-  const el = document.getElementById('paireBars');
-  const done = trades.filter(t => t.resultat && t.pair);
-  if(!done.length){ el.innerHTML='<div class="empty">Pas encore de donnees</div>'; return; }
-
-  const paires = {};
-  done.forEach(t => {
-    if(!paires[t.pair]) paires[t.pair] = {total:0,wins:0};
-    paires[t.pair].total++;
-    if(t.resultat === 'win') paires[t.pair].wins++;
-  });
-
-  const sorted = Object.entries(paires).sort((a,b) => b[1].total - a[1].total);
-  el.innerHTML = sorted.map(([pair, d]) => {
-    const wr = Math.round(d.wins/d.total*100);
-    const col = wr >= 60 ? 'var(--green)' : wr >= 40 ? 'var(--gold)' : 'var(--red)';
-    return `<div class="prog-row">
-      <span class="prog-label" style="min-width:80px">${pair}</span>
-      <div class="prog-bar"><div class="prog-fill" style="width:${wr}%;background:${col}"></div></div>
-      <span class="prog-val" style="color:${col}">${wr}%</span>
-      <span class="prog-count">${d.total}T</span>
-    </div>`;
-  }).join('');
-}
-
-function renderPnlChart(trades){
-  const svg = document.getElementById('pnlChart');
-  const withPnl = [...trades].reverse().filter(t => t.pnl != null);
-  if(withPnl.length < 2){ svg.innerHTML='<text x="50%" y="50%" fill="#2a4a2a" text-anchor="middle" font-size="10" font-family="monospace">Pas assez de donnees P&L</text>'; return; }
-
-  let cumul = 0;
-  const points = withPnl.map(t => { cumul += t.pnl; return cumul; });
-  const W = 600, H = 100, pad = 10;
-  const minV = Math.min(...points, 0), maxV = Math.max(...points, 1);
-  const range = maxV - minV || 1;
-  const toX = i => pad + (i/(points.length-1))*(W-2*pad);
-  const toY = v => H - pad - ((v-minV)/range)*(H-2*pad);
-
-  const pts = points.map((v,i) => `${toX(i)},${toY(v)}`).join(' ');
-  const lastVal = points[points.length-1];
-  const lineColor = lastVal >= 0 ? '#00C853' : '#ff4444';
-
-  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
-  svg.innerHTML = `
-    <defs>
-      <linearGradient id="pnlGrad" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="${lineColor}" stop-opacity="0.3"/>
-        <stop offset="100%" stop-color="${lineColor}" stop-opacity="0"/>
-      </linearGradient>
-    </defs>
-    <line x1="${pad}" y1="${toY(0)}" x2="${W-pad}" y2="${toY(0)}" stroke="#1a2e1a" stroke-width="1" stroke-dasharray="4,4"/>
-    <polyline points="${pts}" fill="none" stroke="${lineColor}" stroke-width="2" stroke-linejoin="round"/>
-    <polygon points="${toX(0)},${H-pad} ${pts} ${toX(points.length-1)},${H-pad}" fill="url(#pnlGrad)"/>
-    <text x="${W-pad}" y="${toY(lastVal)-4}" fill="${lineColor}" font-size="9" text-anchor="end" font-family="monospace">${lastVal>=0?'+':''}${lastVal.toFixed(0)}E</text>
-  `;
-}
-
-function renderWrChart(trades){
-  const svg = document.getElementById('wrChart');
-  const done = [...trades].reverse().filter(t => t.resultat);
-  if(done.length < 3){ svg.innerHTML='<text x="50%" y="50%" fill="#2a4a2a" text-anchor="middle" font-size="10" font-family="monospace">Minimum 3 trades</text>'; return; }
-
-  const window = 10;
-  const wrs = [];
-  for(let i = 0; i < done.length; i++){
-    const slice = done.slice(Math.max(0, i-window+1), i+1);
-    const wins = slice.filter(t => t.resultat === 'win').length;
-    wrs.push(Math.round(wins/slice.length*100));
-  }
-
-  const W = 600, H = 100, pad = 10;
-  const toX = i => pad + (i/(wrs.length-1))*(W-2*pad);
-  const toY = v => H - pad - (v/100)*(H-2*pad);
-  const pts = wrs.map((v,i) => `${toX(i)},${toY(v)}`).join(' ');
-  const last = wrs[wrs.length-1];
-  const col = last >= 50 ? '#00C853' : '#ff4444';
-
-  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
-  svg.innerHTML = `
-    <line x1="${pad}" y1="${toY(50)}" x2="${W-pad}" y2="${toY(50)}" stroke="#1a2e1a" stroke-width="1" stroke-dasharray="4,4"/>
-    <text x="${pad+2}" y="${toY(50)-3}" fill="#2a4a2a" font-size="8" font-family="monospace">50%</text>
-    <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round"/>
-    <circle cx="${toX(wrs.length-1)}" cy="${toY(last)}" r="4" fill="${col}"/>
-    <text x="${toX(wrs.length-1)+6}" y="${toY(last)+4}" fill="${col}" font-size="9" font-family="monospace">${last}%</text>
-  `;
-}
-
-function renderTable(trades){
-  const tbody = document.getElementById('tradeBody');
-  const recent = trades.slice(0, 20);
-  if(!recent.length){ tbody.innerHTML='<tr><td colspan="10" class="empty">Aucun trade</td></tr>'; return; }
-
-  const DC = {ATTENDRE:'#ff6666',SIGNAL:'#FFD700',EXECUTION:'#00C853',MANUEL:'#C0C0C0'};
-
-  tbody.innerHTML = recent.map(t => {
-    const rc = t.resultat ? `<span class="badge badge-${t.resultat}">${t.resultat?.toUpperCase()}</span>` : '<span style="color:#2a4a2a;font-size:9px">--</span>';
-    const cc = t.contexte_marche ? `<span class="badge badge-${t.contexte_marche}">${t.contexte_marche?.toUpperCase()}</span>` : '<span style="color:#2a4a2a">--</span>';
-    const dc = t.difficulte ? `<span class="badge badge-${t.difficulte}">${t.difficulte?.toUpperCase()}</span>` : '<span style="color:#2a4a2a">--</span>';
-    const pnl = t.pnl != null ? `<span style="color:${t.pnl>=0?'var(--green)':'var(--red)'}; font-weight:700">${t.pnl>=0?'+':''}${t.pnl}E</span>` : '--';
-    const dec = `<span style="color:${DC[t.decision]||'#888'};font-size:9px">${t.decision||'--'}</span>`;
-    return `<tr>
-      <td style="color:var(--muted)">${t.id}</td>
-      <td style="color:var(--muted)">${(t.date||'').substring(0,16)}</td>
-      <td style="color:var(--gold);font-weight:700">${t.pair||'--'}</td>
-      <td style="color:var(--silver)">${t.tf||'--'}</td>
-      <td style="color:var(--text)">${t.score||'--'}</td>
-      <td>${dec}</td>
-      <td>${rc}</td>
-      <td>${cc}</td>
-      <td>${dc}</td>
-      <td>${pnl}</td>
-    </tr>`;
-  }).join('');
-}
-
-// Chargement initial + refresh auto toutes les 60s
-// ============ SUIVI DES REGLES ============
-// LISTE DES REGLES : ajoute une ligne ici a chaque nouvelle regle activee.
-// date au format 'AAAA-MM-JJ'. Le calcul avant/apres se fait automatiquement.
-const REGLES = [
-  {nom:"POINT ZERO (etat systeme)", date:"2026-07-19", note:"reference"},
-  {nom:"Garde-fou RSI (fail-closed)", date:"2026-07-18", note:"bloque entrees si RSI inconnu ou extreme"},
-  {nom:"Daily crypto via Binance", date:"2026-07-18", note:"vrai Daily pour BTC/ETH/SOL"},
-  {nom:"Penalite Daily manquant (-15)", date:"2026-07-18", note:"score reduit si pas de Daily"},
-  {nom:"Detecteur de regime (observation)", date:"2026-07-19", note:"TREND/RANGE/INDECIS, sans pouvoir"},
-  // Pour ajouter une regle : copie une ligne ci-dessus et change nom + date.
-];
-
-// Calcule le winrate (win / (win+loss+be)) sur une liste de trades
-function winrateDe(trades){
-  let w=0, l=0, be=0;
-  trades.forEach(t=>{
-    if(t.resultat==='win') w++;
-    else if(t.resultat==='loss') l++;
-    else if(t.resultat==='be') be++;
-  });
-  const pris = w+l+be;
-  return pris>0 ? {wr:Math.round(w/pris*100), n:pris} : {wr:null, n:0};
-}
-
-// Convertit la date d'un trade (created_at ISO, ou date FR) en objet Date comparable
-function dateTrade(t){
-  const s = t.created_at || t.date || '';
-  // created_at est en ISO (2026-07-18T...), directement parsable
-  const d = new Date(s);
-  return isNaN(d.getTime()) ? null : d;
-}
-
-function renderRegles(trades){
-  const body = document.getElementById('reglesBody');
-  if(!body) return;
-  if(!trades || !trades.length){
-    body.innerHTML = '<tr><td colspan="6" class="empty">Aucun trade</td></tr>';
-    return;
-  }
-  // Trie les regles par date croissante
-  const regles = [...REGLES].sort((a,b)=> new Date(a.date) - new Date(b.date));
-  body.innerHTML = regles.map(r=>{
-    const dRegle = new Date(r.date);
-    const avant = trades.filter(t=>{ const d=dateTrade(t); return d && d < dRegle; });
-    const apres = trades.filter(t=>{ const d=dateTrade(t); return d && d >= dRegle; });
-    const wrAv = winrateDe(avant);
-    const wrAp = winrateDe(apres);
-    // Impact = difference de winrate, seulement si assez de donnees des deux cotes
-    let impact = '--', impactColor = 'var(--muted)';
-    if(wrAv.wr!==null && wrAp.wr!==null && wrAv.n>=5 && wrAp.n>=5){
-      const diff = wrAp.wr - wrAv.wr;
-      impact = (diff>=0?'+':'') + diff + ' pts';
-      impactColor = diff>0 ? 'var(--green)' : diff<0 ? 'var(--red)' : 'var(--muted)';
-    } else if(wrAp.n < 5){
-      impact = 'N<5 (attendre)';
-    } else {
-      impact = 'pas de "avant"';
+@app.route("/trade-peak", methods=["POST"])
+def trade_peak():
+    try:
+        d = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"error": "json invalide"}), 400
+    entry = {
+        "ticket": d.get("ticket"),
+        "symbol": d.get("symbol", ""),
+        "peak_r": d.get("peak_r", 0),
+        "profit_final": d.get("profit_final", 0),
+        "ts": datetime.now(timezone.utc).isoformat()
     }
-    const avTxt = wrAv.wr!==null ? (wrAv.wr+'% ('+wrAv.n+'T)') : '--';
-    const apTxt = wrAp.wr!==null ? (wrAp.wr+'% ('+wrAp.n+'T)') : '--';
-    return '<tr style="border-bottom:1px solid var(--border)">'
-      + '<td style="padding:8px 6px;color:var(--text)">'+r.nom+'</td>'
-      + '<td style="padding:8px 6px;color:var(--muted);font-family:monospace">'+r.date+'</td>'
-      + '<td style="padding:8px 6px;color:var(--silver)">'+avTxt+'</td>'
-      + '<td style="padding:8px 6px;color:var(--silver)">'+apTxt+'</td>'
-      + '<td style="padding:8px 6px;color:var(--muted)">'+wrAp.n+'</td>'
-      + '<td style="padding:8px 6px;font-weight:700;color:'+impactColor+'">'+impact+'</td>'
-      + '</tr>';
-  }).join('');
+    TRADE_PEAKS.append(entry)
+    _save_peaks()
+    return jsonify({"ok": True, "recorded": entry})
+
+@app.route("/trade-peaks", methods=["GET"])
+def trade_peaks_list():
+    """Renvoie les donnees de sommet + une petite synthese pour decider du trailing."""
+    peaks = [p for p in TRADE_PEAKS if p.get("peak_r") is not None]
+    n = len(peaks)
+    synthese = {}
+    if n > 0:
+        pr = [float(p["peak_r"]) for p in peaks]
+        # combien de trades ont atteint au moins 1R, 1.5R, 2R
+        synthese = {
+            "nb_trades": n,
+            "sommet_moyen_R": round(sum(pr) / n, 2),
+            "ont_atteint_1R_pct": round(100 * sum(1 for x in pr if x >= 1.0) / n),
+            "ont_atteint_1_5R_pct": round(100 * sum(1 for x in pr if x >= 1.5) / n),
+            "ont_atteint_2R_pct": round(100 * sum(1 for x in pr if x >= 2.0) / n),
+            "ont_atteint_3R_pct": round(100 * sum(1 for x in pr if x >= 3.0) / n),
+        }
+    return jsonify({"synthese": synthese, "trades": peaks[-100:]})
+
+# ── TAILLE DE LOT (securite v4) ───────────────────────────────
+# Le systeme affichait "Risque 1%" mais laissait le trader mettre 1 lot fixe.
+# Resultat : risque reel entre 0,3% et 3% selon l'instrument (cas Or : -893 EUR).
+# Cette route calcule la taille exacte : risque EUR / (distance SL x taille contrat / taux EUR)
+
+CONTRACT_SIZES = {
+    "GOLD": 100, "SILVER": 5000,          # onces par lot (Admiral)
+    "BRENT": 100, "CRUDOIL": 100,          # barils par lot
+    "US100": 1, "[SP500]": 1, "[DJI30]": 1,
+    "GERMANY40": 1, "[FTSE100]": 1,        # indices : 1 point = ~1 unite (a verifier)
+    # Cryptos (CFD Admiral : 1 lot = 1 unite pour BTC/ETH)
+    "BTCUSD": 1, "ETHUSD": 1,
+    # Cryptos hors MT4 (Binance, non executables sur le compte) : indicatif
+    "SOLUSD": 1, "BNBUSD": 1, "XRPUSD": 1000, "ADAUSD": 1000
+}
+QUOTE_OVERRIDES = {
+    "GOLD": "USD", "SILVER": "USD", "BRENT": "USD", "CRUDOIL": "USD",
+    "US100": "USD", "[SP500]": "USD", "[DJI30]": "USD",
+    "GERMANY40": "EUR", "[FTSE100]": "GBP",
+    "BTCUSD": "USD", "ETHUSD": "USD", "SOLUSD": "USD",
+    "BNBUSD": "USD", "XRPUSD": "USD", "ADAUSD": "USD"
+}
+FALLBACK_EUR = {"USD": 1.14, "JPY": 184.5, "CAD": 1.62, "CHF": 0.92, "GBP": 0.856, "EUR": 1.0}
+
+# Distance minimale du stop par instrument (garde-fou anti "0,2 pip")
+MIN_STOP_DIST = {
+    "GOLD": 3.0, "SILVER": 0.30, "BRENT": 0.30, "CRUDOIL": 0.30,
+    "US100": 15.0, "[SP500]": 8.0, "[DJI30]": 30.0, "GERMANY40": 15.0, "[FTSE100]": 10.0,
+    "BTCUSD": 300.0, "ETHUSD": 15.0, "SOLUSD": 1.5,
+    "BNBUSD": 5.0, "XRPUSD": 0.02, "ADAUSD": 0.01
 }
 
-loadAll();
-setInterval(loadAll, 60000);
-</script>
-</body>
-</html>
+def eur_rate(quote):
+    """Combien de 'quote' pour 1 EUR — via les prix live MT4, sinon taux de secours."""
+    if quote == "EUR":
+        return 1.0
+    d = redis_get(f"price:EUR{quote}") or mt4_prices_ram.get("EUR" + quote)
+    if d and d.get("bid"):
+        try:
+            v = float(d["bid"])
+            if v > 0:
+                return v
+        except Exception:
+            pass
+    return FALLBACK_EUR.get(quote, 1.0)
+
+@app.route("/lot-size", methods=["GET"])
+def lot_size():
+    symbol = request.args.get("symbol", "").upper().replace("/", "")
+    try:
+        entry = float(request.args.get("entry"))
+        sl = float(request.args.get("sl"))
+    except Exception:
+        return jsonify({"error": "Parametres entry et sl requis (nombres)"}), 400
+    try:
+        balance = float(request.args.get("balance", os.environ.get("ACCOUNT_BALANCE", "92000")))
+        risk_pct = float(request.args.get("risk_pct", "1"))
+    except Exception:
+        balance, risk_pct = 92000.0, 1.0
+
+    dist = abs(entry - sl)
+    if dist <= 0:
+        return jsonify({"error": "SL identique a l'entree"}), 400
+
+    contract = CONTRACT_SIZES.get(symbol, 100000)  # forex standard : 100 000 unites
+    quote = QUOTE_OVERRIDES.get(symbol, symbol[-3:] if len(symbol) >= 6 else "USD")
+    rate = eur_rate(quote)
+
+    risk_per_lot_quote = dist * contract          # perte au SL pour 1 lot, en devise de cotation
+    risk_per_lot_eur = risk_per_lot_quote / rate if rate > 0 else risk_per_lot_quote
+    target_risk_eur = balance * risk_pct / 100.0
+
+    lots = target_risk_eur / risk_per_lot_eur if risk_per_lot_eur > 0 else 0
+    lots = math.floor(lots * 100) / 100.0          # arrondi vers le bas, pas de sur-risque
+    warning = None
+    if lots < 0.01:
+        lots = 0.01
+        warning = "Stop tres large : meme 0.01 lot depasse le risque cible"
+    if lots > 5:
+        lots = 5.0
+        warning = "Taille plafonnee a 5 lots par securite"
+    if symbol in ("US100", "[SP500]", "[DJI30]", "GERMANY40", "[FTSE100]"):
+        warning = "Indice : valeur du point a verifier chez Admiral — lot indicatif"
+    if symbol in ("SOLUSD", "BNBUSD", "XRPUSD", "ADAUSD"):
+        warning = "Crypto hors MT4 (source Binance) — non executable sur le compte demo, taille indicative"
+
+    # Garde-fou : distance minimale du stop
+    is_jpy = symbol.endswith("JPY")
+    min_stop = MIN_STOP_DIST.get(symbol, 0.15 if is_jpy else 0.0015)
+    stop_ok = dist >= min_stop
+
+    risk_real_eur = round(lots * risk_per_lot_eur, 2)
+    return jsonify({
+        "symbol": symbol,
+        "lots": lots,
+        "risk_eur": risk_real_eur,
+        "risk_pct_reel": round(risk_real_eur / balance * 100, 2) if balance > 0 else None,
+        "distance_sl": round(dist, 5),
+        "stop_ok": stop_ok,
+        "min_stop": min_stop,
+        "stop_warning": None if stop_ok else f"STOP TROP SERRE : {round(dist,5)} < minimum {min_stop} pour {symbol} — niveaux a recalculer",
+        "warning": warning,
+        "balance_utilisee": balance
+    })
+
+@app.route("/market-status/<symbol>", methods=["GET"])
+def market_status_symbol(symbol):
+    key = symbol.upper().replace("/", "")
+    opened = market_open_for(key)
+    return jsonify({
+        "symbol": key,
+        "is_crypto": is_crypto(key),
+        "market_open": opened,
+        "now_paris": datetime.now(PARIS_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    })
+
+# ── TELEGRAM ──────────────────────────────────────────────────
+@app.route("/telegram", methods=["POST"])
+def telegram():
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"error": "JSON invalide"}), 400
+    text = data.get("text", "")
+    trade_id = data.get("trade_id")
+
+    ftmo_override = data.get("ftmo_override", False)
+    wait_override = data.get("wait_override", False)
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+
+    if trade_id and wait_override:
+        # Signal ATTENDRE — boutons Je prends / Je passe
+        payload["reply_markup"] = {
+            "inline_keyboard": [[
+                {"text": "⚡ Je prends", "callback_data": f"wait_{trade_id}_take"},
+                {"text": "❌ Je passe",  "callback_data": f"wait_{trade_id}_pass"}
+            ]]
+        }
+    elif trade_id and ftmo_override:
+        # Signal bloqué FTMO
+        payload["reply_markup"] = {
+            "inline_keyboard": [[
+                {"text": "⚠️ Ignorer FTMO — Je prends", "callback_data": f"ftmo_{trade_id}_take"},
+                {"text": "❌ Ne pas prendre",            "callback_data": f"ftmo_{trade_id}_skip"}
+            ]]
+        }
+    elif trade_id:
+        payload["reply_markup"] = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ WIN",  "callback_data": f"r_{trade_id}_win"},
+                    {"text": "❌ LOSS", "callback_data": f"r_{trade_id}_loss"},
+                    {"text": "➖ BE",   "callback_data": f"r_{trade_id}_be"}
+                ],
+                [
+                    {"text": "⏭️ NON DÉCLENCHÉ", "callback_data": f"r_{trade_id}_nondeclenche"}
+                ]
+            ]
+        }
+
+    resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload).json()
+
+    if trade_id and resp.get("ok"):
+        pending_feedback[str(trade_id)] = {
+            "step": "resultat",
+            "chat_id": TELEGRAM_CHAT_ID,
+            "message_id": resp["result"]["message_id"]
+        }
+
+    return jsonify(resp)
+
+# ── WEBHOOK TELEGRAM ──────────────────────────────────────────
+@app.route("/webhook/telegram", methods=["POST"])
+def telegram_webhook():
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"ok": True})
+
+    # ── MESSAGE TEXTE LIBRE (commentaire journal) ─────────────
+    message = data.get("message")
+    if message and not data.get("callback_query"):
+        chat_id_msg = message.get("chat", {}).get("id")
+        text_msg = message.get("text", "").strip()
+        if text_msg and chat_id_msg and str(chat_id_msg) == str(TELEGRAM_CHAT_ID):
+            # Chercher si un trade attend un commentaire
+            waiting_trade = None
+            for tid, fb in list(pending_feedback.items()):
+                if fb.get("step") == "commentaire":
+                    waiting_trade = tid
+                    break
+            if waiting_trade:
+                fb = pending_feedback[waiting_trade]
+                resultat   = fb.get("resultat","")
+                contexte   = fb.get("contexte","")
+                difficulte = fb.get("difficulte","")
+                label_r = {"win":"✅ WIN","loss":"❌ LOSS","be":"➖ BE"}.get(resultat, resultat)
+                label_c = {"trend":"📈 TREND","range":"📦 RANGE","manipulation":"🪤 MANIPULATION"}.get(contexte, contexte)
+                label_d = {"easy":"🟢 EASY","medium":"🟡 MEDIUM","hard":"🔴 HARD"}.get(difficulte, difficulte)
+                try:
+                    conn = get_db()
+                    c = conn.cursor()
+                    c.execute("UPDATE journal SET commentaire=%s WHERE id=%s",
+                        (text_msg, int(waiting_trade)))
+                    conn.commit()
+                    conn.close()
+                    print(f"Commentaire trade #{waiting_trade}: {text_msg[:50]}")
+                except Exception as e:
+                    print(f"Erreur commentaire: {e}")
+                send_tg(chat_id_msg, f"<b>✅ Trade #{waiting_trade} journalisé</b>\n{label_r} · {label_c} · {label_d}\n💬 <i>{text_msg[:100]}</i>")
+                pending_feedback.pop(waiting_trade, None)
+        return jsonify({"ok": True})
+
+    callback = data.get("callback_query")
+    if not callback:
+        return jsonify({"ok": True})
+
+    callback_id   = callback["id"]
+    callback_data = callback.get("data", "")
+    chat_id       = callback["message"]["chat"]["id"]
+    message_id    = callback["message"]["message_id"]
+
+    # ── ATTENDRE OVERRIDE ────────────────────────────────────
+    if callback_data.startswith("wait_"):
+        parts = callback_data.split("_")
+        if len(parts) == 3:
+            trade_id = parts[1]
+            action   = parts[2]
+
+            if action == "pass":
+                answer_callback(callback_id, "Trade ignoré.")
+                edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+                try:
+                    conn = get_db()
+                    c = conn.cursor()
+                    c.execute("UPDATE journal SET resultat=%s, commentaire=%s WHERE id=%s",
+                        ('passe', 'Signal ATTENDRE — trade non pris', int(trade_id)))
+                    conn.commit()
+                    conn.close()
+                except: pass
+                send_tg(chat_id, "❌ Trade non pris — Signal ATTENDRE respecté.")
+
+            elif action == "take":
+                answer_callback(callback_id, "Override signal ATTENDRE !")
+                edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+                pending_feedback[trade_id] = {"step":"resultat","chat_id":chat_id,"message_id":message_id}
+                send_tg(chat_id, "⚡ Override ATTENDRE — trade pris.\n\nRésultat du trade ?", {
+                    "inline_keyboard": [[
+                        {"text": "✅ WIN",  "callback_data": f"r_{trade_id}_win"},
+                        {"text": "❌ LOSS", "callback_data": f"r_{trade_id}_loss"},
+                        {"text": "➖ BE",   "callback_data": f"r_{trade_id}_be"}
+                    ]]
+                })
+
+    # ── FTMO OVERRIDE ────────────────────────────────────────
+    elif callback_data.startswith("ftmo_"):
+        parts = callback_data.split("_")
+        if len(parts) == 3:
+            trade_id = parts[1]
+            action   = parts[2]
+
+            if action == "skip":
+                answer_callback(callback_id, "Trade ignoré.")
+                edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+                send_tg(chat_id, "❌ Trade non pris — FTMO respecté.")
+
+            elif action == "take":
+                answer_callback(callback_id, "Trade pris malgré FTMO !")
+                edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+                pending_feedback[trade_id] = {"step":"resultat","chat_id":chat_id,"message_id":message_id}
+                send_tg(chat_id, "⚠️ FTMO ignoré — trade pris.\n\nRésultat du trade ?", {
+                    "inline_keyboard": [[
+                        {"text": "✅ WIN",  "callback_data": f"r_{trade_id}_win"},
+                        {"text": "❌ LOSS", "callback_data": f"r_{trade_id}_loss"},
+                        {"text": "➖ BE",   "callback_data": f"r_{trade_id}_be"}
+                    ]]
+                })
+
+    # ── RESULTAT (WIN / LOSS / BE / NON DECLENCHE) ───────────
+    # FIX : le cas "nondeclenche" est traite ICI, dans la premiere branche r_
+    # (avant, il etait dans un elif plus bas qui ne pouvait jamais etre atteint)
+    elif callback_data.startswith("r_"):
+        parts = callback_data.split("_")
+        if len(parts) == 3:
+            trade_id = parts[1]
+            resultat = parts[2]
+
+            if resultat == "nondeclenche":
+                fb = pending_feedback.get(trade_id, {})
+                fb["resultat"] = "nondeclenche"
+                fb["step"] = "nondeclenche_raison"
+                pending_feedback[trade_id] = fb
+                answer_callback(callback_id, "Ordre non déclenché")
+                edit_tg_markup(chat_id, message_id, {"inline_keyboard": [
+                    [{"text": "📍 Point d'entrée trop loin", "callback_data": f"nd_{trade_id}_entree_loin"}],
+                    [{"text": "📊 Spread trop large", "callback_data": f"nd_{trade_id}_spread"}],
+                    [{"text": "🔄 Renversement avant déclenchement", "callback_data": f"nd_{trade_id}_renversement"}],
+                    [{"text": "⏰ Expiré / Weekend", "callback_data": f"nd_{trade_id}_expire"}],
+                    [{"text": "❓ Autre raison", "callback_data": f"nd_{trade_id}_autre"}],
+                ]})
+                send_tg(chat_id, "⏭️ <b>Ordre non déclenché</b>\nQuelle est la raison ?")
+            else:
+                label = {"win":"✅ WIN","loss":"❌ LOSS","be":"➖ BE"}.get(resultat, resultat)
+                pending_feedback[trade_id] = {"step":"contexte","resultat":resultat,"chat_id":chat_id,"message_id":message_id}
+                answer_callback(callback_id, f"{label} noté !")
+                edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+                send_tg(chat_id, f"{label} enregistré.\n\n<b>Type de marché ?</b>", {
+                    "inline_keyboard": [[
+                        {"text": "📈 TREND",        "callback_data": f"c_{trade_id}_trend"},
+                        {"text": "📦 RANGE",        "callback_data": f"c_{trade_id}_range"},
+                        {"text": "🪤 MANIPULATION", "callback_data": f"c_{trade_id}_manipulation"}
+                    ]]
+                })
+
+    # ── CONTEXTE MARCHE ──────────────────────────────────────
+    elif callback_data.startswith("c_"):
+        parts = callback_data.split("_")
+        if len(parts) == 3:
+            trade_id = parts[1]
+            contexte = parts[2]
+            label_c = {"trend":"📈 TREND","range":"📦 RANGE","manipulation":"🪤 MANIPULATION"}.get(contexte, contexte)
+            fb = pending_feedback.get(trade_id, {})
+            fb["contexte"] = contexte
+            fb["step"] = "difficulte"
+            pending_feedback[trade_id] = fb
+            answer_callback(callback_id, f"{label_c} noté !")
+            edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+            send_tg(chat_id, f"{label_c} noté.\n\n<b>Difficulté du setup ?</b>", {
+                "inline_keyboard": [[
+                    {"text": "🟢 EASY",   "callback_data": f"d_{trade_id}_easy"},
+                    {"text": "🟡 MEDIUM", "callback_data": f"d_{trade_id}_medium"},
+                    {"text": "🔴 HARD",   "callback_data": f"d_{trade_id}_hard"}
+                ]]
+            })
+
+    # ── DIFFICULTE ───────────────────────────────────────────
+    elif callback_data.startswith("d_"):
+        parts = callback_data.split("_")
+        if len(parts) == 3:
+            trade_id   = parts[1]
+            difficulte = parts[2]
+            label_d = {"easy":"🟢 EASY","medium":"🟡 MEDIUM","hard":"🔴 HARD"}.get(difficulte, difficulte)
+            fb = pending_feedback.get(trade_id, {})
+            resultat = fb.get("resultat","")
+            contexte = fb.get("contexte","")
+            label_r = {"win":"✅ WIN","loss":"❌ LOSS","be":"➖ BE"}.get(resultat, resultat)
+            label_c = {"trend":"📈 TREND","range":"📦 RANGE","manipulation":"🪤 MANIPULATION"}.get(contexte, contexte)
+            try:
+                conn = get_db()
+                c = conn.cursor()
+                c.execute("UPDATE journal SET resultat=%s, contexte_marche=%s, difficulte=%s WHERE id=%s",
+                    (resultat, contexte, difficulte, int(trade_id)))
+                conn.commit()
+                conn.close()
+                print(f"Journal mis a jour: trade #{trade_id} = {resultat} / {contexte} / {difficulte}")
+            except Exception as e:
+                print(f"Erreur update journal: {e}")
+            answer_callback(callback_id, "Presque fini !")
+            edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+            # Passer à l'étape commentaire
+            fb["resultat"] = resultat
+            fb["contexte"] = contexte
+            fb["difficulte"] = difficulte
+            fb["step"] = "systeme"
+            pending_feedback[trade_id] = fb
+            send_tg(chat_id,
+                f"{label_d} noté.\n\n<b>🦊 Système suivi ?</b>\nEntrée au signal, SL/TP du plan, zéro main ?",
+                {"inline_keyboard": [[
+                    {"text": "✅ OUI — plan respecté", "callback_data": f"s_{trade_id}_oui"},
+                    {"text": "❌ NON — hors système",  "callback_data": f"s_{trade_id}_non"}
+                ]]})
+
+    # ── SYSTEME SUIVI ? (discipline) ─────────────────────────
+    elif callback_data.startswith("s_"):
+        parts = callback_data.split("_")
+        if len(parts) == 3:
+            trade_id = parts[1]
+            suivi    = parts[2]  # oui / non
+            label_s = "✅ Plan respecté" if suivi == "oui" else "❌ Hors système"
+            try:
+                conn = get_db()
+                c = conn.cursor()
+                c.execute("UPDATE journal SET systeme_suivi=%s WHERE id=%s",
+                    (suivi, int(trade_id)))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                print(f"Erreur systeme_suivi: {e}")
+            fb = pending_feedback.get(trade_id, {})
+            fb["systeme_suivi"] = suivi
+            fb["step"] = "commentaire"
+            pending_feedback[trade_id] = fb
+            answer_callback(callback_id, label_s)
+            edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+            send_tg(chat_id,
+                f"{label_s} noté.\n\n<b>💬 Commentaire sur ce trade ?</b>\nTape ton analyse, ce que tu as vu, pourquoi tu as pris ou raté ce trade.\n\nOu appuie sur Passer pour terminer.",
+                {"inline_keyboard": [[{"text": "⏭️ Passer", "callback_data": f"skip_comment_{trade_id}"}]]})
+
+    # ── RAISON NON DÉCLENCHÉ ─────────────────────────────────────
+    elif callback_data.startswith("nd_"):
+        parts = callback_data.split("_")
+        trade_id = parts[1]
+        raison_code = "_".join(parts[2:])
+        raisons = {
+            "entree_loin": "Point d'entrée trop loin du prix",
+            "spread": "Spread trop large — prix entre BID/ASK",
+            "renversement": "Renversement avant déclenchement",
+            "expire": "Ordre expiré / Weekend",
+            "autre": "Autre raison"
+        }
+        raison_txt = raisons.get(raison_code, raison_code)
+        fb = pending_feedback.get(trade_id, {})
+        fb["raison_sortie"] = raison_txt
+        fb["step"] = "nondeclenche_direction"
+        pending_feedback[trade_id] = fb
+        answer_callback(callback_id, "Raison notée")
+        edit_tg_markup(chat_id, message_id, {"inline_keyboard": [
+            [{"text": "✅ Direction correcte", "callback_data": f"ndd_{trade_id}_oui"}],
+            [{"text": "❌ Direction incorrecte", "callback_data": f"ndd_{trade_id}_non"}],
+        ]})
+        send_tg(chat_id, f"Raison : <i>{raison_txt}</i>\n\nLa direction du système était-elle correcte ?")
+
+    # ── DIRECTION NON DÉCLENCHÉ ───────────────────────────────────
+    elif callback_data.startswith("ndd_"):
+        parts = callback_data.split("_")
+        trade_id = parts[1]
+        direction_ok = parts[2]
+        fb = pending_feedback.get(trade_id, {})
+        raison_txt = fb.get("raison_sortie", "")
+        dir_label = "✅ correcte" if direction_ok == "oui" else "❌ incorrecte"
+        try:
+            conn = get_db()
+            c = conn.cursor()
+            c.execute("""UPDATE journal SET resultat='nondeclenche',
+                direction_ok=%s, raison_sortie=%s,
+                commentaire=%s WHERE id=%s""",
+                (direction_ok, raison_txt,
+                 f"Ordre non déclenché — {raison_txt}", int(trade_id)))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Erreur nondeclenche: {e}")
+        answer_callback(callback_id, "Journalisé !")
+        edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+        send_tg(chat_id,
+            f"<b>⏭️ Trade #{trade_id} — NON DÉCLENCHÉ</b>\n"
+            f"Raison : <i>{raison_txt}</i>\n"
+            f"Direction système : {dir_label}\n\n"
+            f"💬 Ajoute un commentaire ou appuie sur Passer.",
+            {"inline_keyboard": [[{"text": "⏭️ Passer", "callback_data": f"skip_comment_{trade_id}"}]]})
+        fb["step"] = "commentaire"
+        pending_feedback[trade_id] = fb
+
+    # ── SKIP COMMENTAIRE ─────────────────────────────────────
+    elif callback_data.startswith("skip_comment_"):
+        trade_id = callback_data.replace("skip_comment_", "")
+        fb = pending_feedback.get(trade_id, {})
+        resultat   = fb.get("resultat","")
+        contexte   = fb.get("contexte","")
+        difficulte = fb.get("difficulte","")
+        label_r = {"win":"✅ WIN","loss":"❌ LOSS","be":"➖ BE"}.get(resultat, resultat)
+        label_c = {"trend":"📈 TREND","range":"📦 RANGE","manipulation":"🪤 MANIPULATION"}.get(contexte, contexte)
+        label_d = {"easy":"🟢 EASY","medium":"🟡 MEDIUM","hard":"🔴 HARD"}.get(difficulte, difficulte)
+        send_tg(chat_id, f"<b>✅ Trade #{trade_id} journalisé</b>\n{label_r} · {label_c} · {label_d}\n<i>Sans commentaire</i>")
+        answer_callback(callback_id, "Journalisé !")
+        edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+        pending_feedback.pop(trade_id, None)
+
+    return jsonify({"ok": True})
+
+@app.route("/admin/reset-journal", methods=["GET"])
+def reset_journal():
+    secret = request.args.get("key","")
+    if secret != "RENARD2026":
+        return jsonify({"error": "Non autorise"}), 403
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        # Garder uniquement les trades d'aujourd'hui (19/06/2026)
+        c.execute("DELETE FROM journal WHERE created_at NOT LIKE '2026-06-19%'")
+        deleted = c.rowcount
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True, "message": f"{deleted} anciens trades supprimes. Trades du 19/06 conserves."})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+def setup_webhook():
+    webhook_url = "https://trading-master-backend.onrender.com/webhook/telegram"
+    resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook", json={"url": webhook_url})
+    return jsonify(resp.json())
+
+# ── ANTHROPIC ─────────────────────────────────────────────────
+@app.route("/anthropic", methods=["POST"])
+def anthropic():
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({"error": "JSON invalide"}), 400
+    resp = requests.post("https://api.anthropic.com/v1/messages",
+        headers={"Content-Type":"application/json","x-api-key":ANTHROPIC_KEY,"anthropic-version":"2023-06-01"},
+        json=data)
+    return jsonify(resp.json())
+
+# ── PRIX ──────────────────────────────────────────────────────
+@app.route("/price", methods=["POST"])
+def receive_price():
+    data = request.get_json(force=True, silent=True)
+    if not data: return jsonify({"error": "JSON invalide"}), 400
+    symbol = data.get("symbol","").upper().replace("/","")
+    data = stamp(data)
+    if not redis_set(f"price:{symbol}", data): mt4_prices_ram[symbol] = data
+    return jsonify({"success": True})
+
+@app.route("/price/<symbol>", methods=["GET"])
+def get_price(symbol):
+    key = symbol.upper().replace("/","")
+    data = redis_get(f"price:{key}") or mt4_prices_ram.get(key)
+    if data: return jsonify(enrich(data, key))
+    return jsonify({"error": "Prix non disponible", "market_open": market_open_for(key)}), 404
+
+# ── BOUGIES H1 ────────────────────────────────────────────────
+@app.route("/candles", methods=["POST"])
+def receive_candles():
+    data = request.get_json(force=True, silent=True)
+    if not data: return jsonify({"error": "JSON invalide"}), 400
+    symbol = data.get("symbol","").upper().replace("/","")
+    data = stamp(data)
+    if not redis_set(f"candles:{symbol}", data): mt4_candles_ram[symbol] = data
+    print(f"Bougies H1: {symbol} — {len(data.get('candles',[]))} bougies")
+    return jsonify({"success": True})
+
+@app.route("/candles/<symbol>", methods=["GET"])
+def get_candles(symbol):
+    key = symbol.upper().replace("/","")
+    data = redis_get(f"candles:{key}") or mt4_candles_ram.get(key)
+    if data: return jsonify(enrich(data, key))
+    return jsonify({"error": "Bougies non disponibles", "market_open": market_open_for(key)}), 404
+
+# ── BOUGIES M15 ───────────────────────────────────────────────
+@app.route("/m15", methods=["POST"])
+def receive_m15():
+    raw = request.get_data(as_text=True)
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        print(f"M15 JSON echec: {raw[:200]}")
+        return jsonify({"error": "JSON invalide"}), 400
+    symbol = data.get("symbol","").upper().replace("/","")
+    data = stamp(data)
+    if not redis_set(f"m15:{symbol}", data): mt4_m15_ram[symbol] = data
+    print(f"Bougies M15: {symbol} — {len(data.get('candles',[]))} bougies")
+    return jsonify({"success": True})
+
+@app.route("/m15/<symbol>", methods=["GET"])
+def get_m15(symbol):
+    key = symbol.upper().replace("/","")
+    data = redis_get(f"m15:{key}") or mt4_m15_ram.get(key)
+    if data: return jsonify(enrich(data, key))
+    return jsonify({"error": "Bougies M15 non disponibles", "market_open": market_open_for(key)}), 404
+
+# ── BOUGIES DAILY ─────────────────────────────────────────────
+@app.route("/daily", methods=["POST"])
+def receive_daily():
+    data = request.get_json(force=True, silent=True)
+    if not data: return jsonify({"error": "JSON invalide"}), 400
+    symbol = data.get("symbol","").upper().replace("/","")
+    data = stamp(data)
+    if not redis_set(f"daily:{symbol}", data): mt4_daily_ram[symbol] = data
+    print(f"Daily: {symbol} — {len(data.get('candles',[]))} bougies")
+    return jsonify({"success": True})
+
+@app.route("/daily/<symbol>", methods=["GET"])
+def get_daily(symbol):
+    key = symbol.upper().replace("/","")
+    data = redis_get(f"daily:{key}") or mt4_daily_ram.get(key)
+    if data: return jsonify(enrich(data, key))
+    return jsonify({"error": "Daily non disponible", "market_open": market_open_for(key)}), 404
+
+# ── SCREENSHOT ────────────────────────────────────────────────
+@app.route("/screenshot", methods=["POST"])
+def receive_screenshot():
+    data = request.get_json(force=True, silent=True)
+    if not data: return jsonify({"error": "JSON invalide"}), 400
+    symbol = data.get("symbol","").upper().replace("/","")
+    mt4_screenshots_ram[symbol] = data
+    return jsonify({"success": True})
+
+@app.route("/screenshot/<symbol>", methods=["GET"])
+def get_screenshot(symbol):
+    key = symbol.upper().replace("/","")
+    shot = mt4_screenshots_ram.get(key)
+    if shot: return jsonify(shot)
+    return jsonify({"error": "Screenshot non disponible"}), 404
+
+# ── JOURNAL ───────────────────────────────────────────────────
+@app.route("/journal", methods=["POST"])
+def add_trade():
+    data = request.get_json(force=True, silent=True)
+    if not data: return jsonify({"error": "JSON invalide"}), 400
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''INSERT INTO journal
+            (date,pair,tf,session,score,decision,bias,entry,sl,tp,rr,
+             resultat,contexte_marche,difficulte,pnl,commentaire,created_at,
+             direction_ok,entree_ok,sortie_ok,raison_sortie)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id''',
+            (data.get("date"),data.get("pair"),data.get("tf"),data.get("session"),
+             data.get("score"),data.get("decision"),data.get("bias"),
+             data.get("entry"),data.get("sl"),data.get("tp"),data.get("rr"),
+             data.get("resultat"),data.get("contexte_marche"),data.get("difficulte"),
+             data.get("pnl"),data.get("commentaire"),datetime.now().isoformat(),
+             data.get("direction_ok"),data.get("entree_ok"),
+             data.get("sortie_ok"),data.get("raison_sortie")))
+        conn.commit()
+        trade_id = c.fetchone()["id"]
+        conn.close()
+        return jsonify({"success": True, "id": trade_id})
+    except Exception as e:
+        print(f"Erreur add_trade: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/journal", methods=["GET"])
+def get_trades():
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT * FROM journal ORDER BY id DESC LIMIT 100")
+        rows = c.fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/journal/<int:trade_id>", methods=["PUT"])
+def update_trade(trade_id):
+    data = request.get_json(force=True, silent=True)
+    if not data: return jsonify({"error": "JSON invalide"}), 400
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("UPDATE journal SET resultat=%s,contexte_marche=%s,difficulte=%s,pnl=%s,commentaire=%s WHERE id=%s",
+            (data.get("resultat"),data.get("contexte_marche"),data.get("difficulte"),
+             data.get("pnl"),data.get("commentaire"),trade_id))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/journal/stats", methods=["GET"])
+def get_stats():
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        stats = {}
+        c.execute("SELECT COUNT(*) as n FROM journal"); stats["total"] = c.fetchone()["n"]
+        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat='win'"); stats["wins"] = c.fetchone()["n"]
+        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat='loss'"); stats["losses"] = c.fetchone()["n"]
+        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat='be'"); stats["be"] = c.fetchone()["n"]
+        c.execute("SELECT SUM(pnl) as s FROM journal WHERE pnl IS NOT NULL"); stats["total_pnl"] = round(c.fetchone()["s"] or 0, 2)
+        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat IS NOT NULL AND resultat!=''")
+        done = c.fetchone()["n"]
+        # FIX WINRATE : le winrate ne doit compter QUE les trades reellement pris
+        # (win + loss + be). Avant, 'done' incluait aussi les 'nondeclenche', 'passe',
+        # etc., ce qui gonflait le denominateur et ecrasait le winrate (ex: 12% au lieu du vrai).
+        trades_pris = stats["wins"] + stats["losses"] + stats["be"]
+        stats["trades_pris"] = trades_pris
+        stats["winrate"] = round(stats["wins"]/trades_pris*100) if trades_pris > 0 else 0
+        # Compter les non-declenches a part (info utile, pas dans le winrate)
+        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat='nondeclenche'")
+        stats["non_declenches"] = c.fetchone()["n"]
+        for ctx in ["trend","range","manipulation"]:
+            c.execute("SELECT COUNT(*) as n FROM journal WHERE contexte_marche=%s", (ctx,)); total_ctx = c.fetchone()["n"]
+            c.execute("SELECT COUNT(*) as n FROM journal WHERE contexte_marche=%s AND resultat='win'", (ctx,)); wins_ctx = c.fetchone()["n"]
+            stats[f"ctx_{ctx}"] = {"total":total_ctx,"wins":wins_ctx,"winrate":round(wins_ctx/total_ctx*100) if total_ctx>0 else 0}
+        c.execute("SELECT COUNT(*) as n, COALESCE(SUM(pnl),0) as p FROM journal WHERE systeme_suivi='non' AND resultat IN ('win','loss','be')")
+        row = c.fetchone()
+        stats["hors_systeme"] = {"total": row["n"], "pnl": round(row["p"], 2)}
+        for diff in ["easy","medium","hard"]:
+            c.execute("SELECT COUNT(*) as n FROM journal WHERE difficulte=%s", (diff,)); total_d = c.fetchone()["n"]
+            c.execute("SELECT COUNT(*) as n FROM journal WHERE difficulte=%s AND resultat='win'", (diff,)); wins_d = c.fetchone()["n"]
+            stats[f"diff_{diff}"] = {"total":total_d,"wins":wins_d,"winrate":round(wins_d/total_d*100) if total_d>0 else 0}
+        conn.close()
+        return jsonify(stats)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ── JOURNAL CONTEXT POUR LES AGENTS ──────────────────────────
+@app.route("/journal/context", methods=["GET"])
+def get_journal_context():
+    try:
+        conn = get_db()
+        c = conn.cursor()
+
+        # FILTRE STRICT : uniquement les trades réellement pris
+        # Exclure : décision ATTENDRE auto, trades sans résultat, opportunités manquées
+        # L'agent Memoire n'apprend QUE des trades ou le plan a ete respecte
+        # (systeme_suivi='oui'). Les anciens trades sans etiquette (NULL) restent
+        # comptes pour ne pas effacer l'historique. Les trades 'non' (hors systeme)
+        # sont journalises mais jugent la discipline du trader, pas le systeme.
+        FILTRE = """
+            resultat IN ('win','loss','be')
+            AND (systeme_suivi = 'oui' OR systeme_suivi IS NULL)
+            AND (commentaire NOT LIKE '%%opportunite_manquee%%' OR commentaire IS NULL)
+            AND (commentaire NOT LIKE '%%TRADE NON PRIS%%' OR commentaire IS NULL)
+        """
+
+        c.execute(f"SELECT COUNT(*) as n FROM journal WHERE {FILTRE}")
+        total_done = c.fetchone()["n"]
+        if total_done == 0:
+            conn.close()
+            return jsonify({"context": "", "has_data": False})
+
+        c.execute(f"SELECT COUNT(*) as n FROM journal WHERE {FILTRE} AND resultat='win'")
+        wins = c.fetchone()["n"]
+
+        # Stats ordres non déclenchés (apprentissage direction)
+        nd_correct = 0
+        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat='nondeclenche'")
+        total_nd = c.fetchone()["n"]
+        if total_nd > 0:
+            c.execute("""SELECT COUNT(*) as n FROM journal
+                WHERE resultat='nondeclenche' AND direction_ok='oui'""")
+            nd_correct = c.fetchone()["n"]
+        c.execute(f"SELECT COUNT(*) as n FROM journal WHERE {FILTRE} AND resultat='loss'")
+        losses = c.fetchone()["n"]
+        winrate = round(wins/total_done*100) if total_done > 0 else 0
+
+        c.execute(f"""SELECT pair, COUNT(*) as total,
+            SUM(CASE WHEN resultat='win' THEN 1 ELSE 0 END) as wins
+            FROM journal WHERE {FILTRE} AND pair IS NOT NULL
+            GROUP BY pair ORDER BY total DESC LIMIT 8""")
+        pairs_stats = c.fetchall()
+
+        c.execute(f"""SELECT contexte_marche, COUNT(*) as total,
+            SUM(CASE WHEN resultat='win' THEN 1 ELSE 0 END) as wins
+            FROM journal WHERE {FILTRE} AND contexte_marche IS NOT NULL
+            GROUP BY contexte_marche""")
+        marche_stats = c.fetchall()
+
+        c.execute(f"""SELECT session, COUNT(*) as total,
+            SUM(CASE WHEN resultat='win' THEN 1 ELSE 0 END) as wins
+            FROM journal WHERE {FILTRE} AND session IS NOT NULL
+            GROUP BY session ORDER BY total DESC""")
+        session_stats = c.fetchall()
+
+        ctx = f"HISTORIQUE TRADES REELS ({total_done} trades pris) :\n"
+        ctx += f"- Winrate global : {winrate}% ({wins} wins / {losses} pertes)\n"
+
+        if pairs_stats:
+            ctx += "- Performance par paire :\n"
+            for p in pairs_stats:
+                wr = round(p['wins']/p['total']*100) if p['total'] > 0 else 0
+                adj = "" if p['total'] >= 5 else " (N<5 — donnee insuffisante)"
+                ctx += f"  {p['pair']} : {wr}% sur {p['total']} trades{adj}\n"
+
+        if marche_stats:
+            ctx += "- Performance par marche :\n"
+            for m in marche_stats:
+                wr = round(m['wins']/m['total']*100) if m['total'] > 0 else 0
+                ctx += f"  {m['contexte_marche'].upper()} : {wr}% sur {m['total']} trades\n"
+
+        if session_stats:
+            ctx += "- Performance par session :\n"
+            for s in session_stats:
+                wr = round(s['wins']/s['total']*100) if s['total'] > 0 else 0
+                adj = "" if s['total'] >= 5 else " (N<5 — donnee insuffisante)"
+                ctx += f"  {s['session']} : {wr}% sur {s['total']} trades{adj}\n"
+
+        ctx += "\nINSTRUCTION : "
+        ctx += "Ajuster le score UNIQUEMENT si N>=5 trades sur ce contexte. "
+        ctx += "N<5 = donnee insuffisante = ne pas ajuster. "
+        ctx += "Winrate < 40% et N>=5 = reduire score -2pts. "
+        ctx += "Winrate > 65% et N>=5 = bonus +2pts. "
+
+        # Ajouter stats ordres non déclenchés
+        if total_nd > 0:
+            pct_nd = round(nd_correct/total_nd*100)
+            ctx += f"\nORDRES NON DÉCLENCHÉS ({total_nd} ordres) : "
+            ctx += f"Direction correcte {pct_nd}% des fois. "
+            ctx += "Ces ordres n'ont pas été exécutés mais la direction système était correcte dans la majorité des cas. "
+
+        # Stats qualité
+        c.execute(f"""SELECT
+            SUM(CASE WHEN direction_ok='oui' THEN 1 ELSE 0 END) as dir_ok,
+            SUM(CASE WHEN sortie_ok='be_force' THEN 1 ELSE 0 END) as be_force,
+            SUM(CASE WHEN raison_sortie='ny_trap' THEN 1 ELSE 0 END) as ny_trap,
+            SUM(CASE WHEN raison_sortie='sl_manuel' THEN 1 ELSE 0 END) as sl_manuel
+            FROM journal WHERE {FILTRE}""")
+        qualite = c.fetchone()
+        if qualite and qualite['dir_ok']:
+            ctx += f"\nQUALITE : Direction correcte={qualite['dir_ok']} fois. "
+            if qualite['be_force']: ctx += f"BE force (bon trade)={qualite['be_force']} fois. "
+            if qualite['ny_trap']: ctx += f"NY Trap={qualite['ny_trap']} fois. "
+            ctx += "BE force = bon trade mal gere, ne pas penaliser la direction."
+
+        # ── DISCIPLINE : trades hors systeme (non comptes ci-dessus) ──
+        c.execute("""SELECT COUNT(*) as n, COALESCE(SUM(pnl),0) as p
+            FROM journal WHERE systeme_suivi='non' AND resultat IN ('win','loss','be')""")
+        indis = c.fetchone()
+        if indis and indis['n'] > 0:
+            ctx += f"\nDISCIPLINE : {indis['n']} trades HORS SYSTEME exclus des stats "
+            ctx += f"ci-dessus (PnL cumule : {round(indis['p'],2)} EUR). "
+            ctx += "Ces trades jugent le trader, pas le systeme — ne pas en tenir compte dans le score."
+
+        # ── ETAT DU MARCHE (gel week-end pour les agents) ─────
+        if not forex_market_open():
+            ctx += "\n\nMARCHE FERME : Nous sommes le week-end. Le forex, les metaux, "
+            ctx += "les indices et les petroles sont FERMES — leurs donnees sont figees "
+            ctx += "depuis vendredi 23h Paris. AUCUN signal ne doit etre emis sur ces "
+            ctx += "instruments. Seules les cryptos (donnees Binance) sont analysables. "
+            ctx += "Reouverture dimanche 23h Paris."
+
+        # Ajouter les news macro si disponibles
+        # FIX : c'etait "redis_client" (variable inexistante) -> NameError silencieux
+        # qui vidait tout le contexte journal. Corrige en "r".
+        if r:
+            try:
+                news = r.get("macro_news")
+                if news:
+                    news_txt = news.decode('utf-8') if isinstance(news, bytes) else news
+                    ctx += f"\n{news_txt}"
+            except:
+                pass
+
+        conn.close()
+        return jsonify({"context": ctx, "has_data": True, "total_trades": total_done})
+    except Exception as e:
+        print(f"Erreur journal/context: {e}")
+        return jsonify({"context": "", "has_data": False})
+
+# ── SCHEDULER ─────────────────────────────────────────────────
+def scheduler_job():
+    # Aligne sur la discipline de trading :
+    # 08h00 Paris = London Open · 14h30 Paris = NY Open · jamais le week-end
+    analyzed_today = {'london': None, 'ny': None}
+    while True:
+        try:
+            now = datetime.now(PARIS_TZ)
+            h, m, day = now.hour, now.minute, now.weekday()
+            today = now.strftime('%Y-%m-%d')
+            if day < 5:
+                if h == 8 and m == 0 and analyzed_today['london'] != today:
+                    analyzed_today['london'] = today
+                    trigger_analysis('London Open')
+                if h == 14 and m == 30 and analyzed_today['ny'] != today:
+                    analyzed_today['ny'] = today
+                    trigger_analysis('NY Open')
+        except Exception as e:
+            print(f"Scheduler error: {e}")
+        time.sleep(30)
+
+def fetch_macro_news():
+    """Récupère les news macro depuis Alpha Vantage"""
+    try:
+        url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&topics=forex,economy_macro,financial_markets&sort=LATEST&limit=10&apikey=UCP44WUC4UHAJ2I8"
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        feed = data.get("feed", [])
+        if not feed:
+            return ""
+        summary = "NEWS MACRO DU JOUR:\n"
+        for item in feed[:5]:
+            title = item.get("title","")
+            sentiment = item.get("overall_sentiment_label","neutral")
+            summary += f"- {title} [{sentiment}]\n"
+        # FIX : c'etait "redis_client" (variable inexistante) — les news
+        # n'etaient jamais sauvegardees. Corrige en "r".
+        if r:
+            try:
+                r.setex("macro_news", 43200, summary)
+            except: pass
+        print(f"News macro: {len(feed)} articles")
+        return summary
+    except Exception as e:
+        print(f"Erreur news macro: {e}")
+        return ""
+
+def trigger_analysis(session):
+    try:
+        # Récupérer les news macro et les envoyer sur Telegram
+        news = fetch_macro_news()
+        msg = f"<b>Trading Master V5 — {session}</b>\nAnalyse automatique declenchee."
+        if news:
+            msg += f"\n\n{news}"
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID,
+                  "text": msg,
+                  "parse_mode": "HTML"})
+    except Exception as e:
+        print(f"Trigger error: {e}")
+
+threading.Thread(target=scheduler_job, daemon=True).start()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    def keep_alive():
+        while True:
+            time.sleep(840)
+            try: requests.get("https://trading-master-backend.onrender.com/")
+            except: pass
+    threading.Thread(target=keep_alive, daemon=True).start()
+    app.run(host="0.0.0.0", port=port)
