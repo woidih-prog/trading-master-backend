@@ -82,12 +82,21 @@ mt4_daily_ram   = {}
 mt4_screenshots_ram = {}
 pending_feedback = {}
 
-def redis_set(key, data):
+# Duree de vie des donnees DAILY : 72h.
+# Le Daily est envoye rarement par l'EA et rien n'arrive du vendredi soir au
+# dimanche soir. Avec 24h, la cle expirait le samedi -> "Daily indisponible"
+# tous les lundis, et les 8 agents perdaient la tendance de fond.
+DAILY_TTL = 259200  # 72 heures
+
+def redis_set(key, data, ttl=86400):
+    """ttl par defaut 24h. FIX : les donnees DAILY doivent survivre au week-end
+    (l'EA n'envoie rien du vendredi soir au dimanche soir). Sans TTL long, les
+    cles daily expiraient le samedi -> 'Daily indisponible' tous les lundis."""
     global r
     conn = _get_redis()
     if conn:
         try:
-            conn.set(key, json.dumps(data), ex=86400)
+            conn.set(key, json.dumps(data), ex=ttl)
             return True
         except Exception as e:
             print(f"Redis SET erreur ({key}): {e}")
@@ -882,7 +891,7 @@ def receive_daily():
     if not data: return jsonify({"error": "JSON invalide"}), 400
     symbol = data.get("symbol","").upper().replace("/","")
     data = stamp(data)
-    if not redis_set(f"daily:{symbol}", data): mt4_daily_ram[symbol] = data
+    if not redis_set(f"daily:{symbol}", data, ttl=DAILY_TTL): mt4_daily_ram[symbol] = data
     print(f"Daily: {symbol} — {len(data.get('candles',[]))} bougies")
     return jsonify({"success": True})
 
