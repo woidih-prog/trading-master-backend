@@ -13,7 +13,7 @@ import json
 import math
 
 # ══════════════════════════════════════════════════════════════
-# TRADING MASTER V5 — BACKEND v6
+# TRADING MASTER V5 — BACKEND v9 (MEMOIRE + RAISONNEMENTS)
 # Nouveautes :
 #   1. GEL WEEK-END : /market-status + drapeau market_open sur les donnees
 #   2. ETIQUETTE DE FRAICHEUR : received_ts + age_seconds + stale sur les donnees
@@ -47,33 +47,13 @@ CRYPTO_SYMBOLS = {"BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "BNBUSD", "ADAUSD"}
 STALE_AFTER_SECONDS = 600
 
 # ── REDIS ─────────────────────────────────────────────────────
-def _connect_redis():
-    """Tente une connexion Redis. Renvoie l'objet connecte ou None."""
-    try:
-        conn = redis.from_url(REDIS_URL, decode_responses=True,
-                              socket_connect_timeout=3, socket_timeout=3)
-        conn.ping()
-        print("Redis connecte OK")
-        return conn
-    except Exception as e:
-        print(f"Redis erreur connexion: {e}")
-        return None
-
-r = _connect_redis()
-_last_redis_retry = 0.0
-
-def _get_redis():
-    """Renvoie la connexion Redis, en RETENTANT la connexion toutes les 30s
-    si elle est tombee. FIX : avant, une connexion ratee au demarrage rendait
-    le serveur definitivement sans Redis (panne invisible, 404 partout)."""
-    global r, _last_redis_retry
-    if r is not None:
-        return r
-    now = time.time()
-    if now - _last_redis_retry >= 30:
-        _last_redis_retry = now
-        r = _connect_redis()
-    return r
+try:
+    r = redis.from_url(REDIS_URL, decode_responses=True)
+    r.ping()
+    print("Redis connecte OK")
+except Exception as e:
+    print(f"Redis erreur: {e}")
+    r = None
 
 mt4_prices_ram  = {}
 mt4_candles_ram = {}
@@ -82,37 +62,20 @@ mt4_daily_ram   = {}
 mt4_screenshots_ram = {}
 pending_feedback = {}
 
-# Duree de vie des donnees DAILY : 72h.
-# Le Daily est envoye rarement par l'EA et rien n'arrive du vendredi soir au
-# dimanche soir. Avec 24h, la cle expirait le samedi -> "Daily indisponible"
-# tous les lundis, et les 8 agents perdaient la tendance de fond.
-DAILY_TTL = 259200  # 72 heures
-
-def redis_set(key, data, ttl=86400):
-    """ttl par defaut 24h. FIX : les donnees DAILY doivent survivre au week-end
-    (l'EA n'envoie rien du vendredi soir au dimanche soir). Sans TTL long, les
-    cles daily expiraient le samedi -> 'Daily indisponible' tous les lundis."""
-    global r
-    conn = _get_redis()
-    if conn:
+def redis_set(key, data):
+    if r:
         try:
-            conn.set(key, json.dumps(data), ex=ttl)
+            r.set(key, json.dumps(data), ex=86400)
             return True
-        except Exception as e:
-            print(f"Redis SET erreur ({key}): {e}")
-            r = None  # marquer la connexion comme tombee -> reconnexion auto
+        except: pass
     return False
 
 def redis_get(key):
-    global r
-    conn = _get_redis()
-    if conn:
+    if r:
         try:
-            val = conn.get(key)
+            val = r.get(key)
             if val: return json.loads(val)
-        except Exception as e:
-            print(f"Redis GET erreur ({key}): {e}")
-            r = None  # marquer la connexion comme tombee -> reconnexion auto
+        except: pass
     return None
 
 # ── GEL WEEK-END + FRAICHEUR (helpers) ───────────────────────
@@ -180,20 +143,24 @@ def init_db():
             direction_ok TEXT, entree_ok TEXT, sortie_ok TEXT,
             raison_sortie TEXT
         )''')
-        conn.commit()
-        # Ajouter colonnes si elles n'existent pas (migration).
-        # FIX : sur PostgreSQL, une seule ALTER qui echoue (colonne deja existante)
-        # met TOUTE la transaction en erreur et bloque les colonnes suivantes.
-        # Solution : "ADD COLUMN IF NOT EXISTS" + un commit par colonne, avec
-        # rollback en cas d'echec pour repartir sur une transaction propre.
+        # Ajouter colonnes si elles n'existent pas (migration)
+        # v8 MEMOIRE : les CONDITIONS de chaque analyse, en colonnes exploitables
+        # (avant, elles etaient noyees dans le texte du commentaire = inutilisables)
+        # v9 : le RAISONNEMENT complet (8 agents + orchestrateur) en JSON
+        try:
+            c.execute("ALTER TABLE journal ADD COLUMN rapports_agents TEXT")
+        except: pass
+        for col in ['market_state','regime_ratio','rsi_value','rsi_pente',
+                    'trap','cisd','msu','consensus_long','consensus_short',
+                    'gate_blocked','peak_r']:
+            try:
+                c.execute(f"ALTER TABLE journal ADD COLUMN {col} TEXT")
+            except: pass
         for col in ['direction_ok','entree_ok','sortie_ok','raison_sortie','systeme_suivi']:
             try:
-                c.execute(f"ALTER TABLE journal ADD COLUMN IF NOT EXISTS {col} TEXT")
-                conn.commit()
-                print(f"Colonne verifiee/ajoutee : {col}")
-            except Exception as e:
-                conn.rollback()
-                print(f"Colonne {col} : {e}")
+                c.execute(f"ALTER TABLE journal ADD COLUMN {col} TEXT")
+            except: pass
+        conn.commit()
         conn.close()
         print("PostgreSQL connecte OK")
     except Exception as e:
@@ -223,38 +190,6 @@ def home():
     forex = "OUVERT" if forex_market_open() else "FERME (week-end)"
     return f"Trading Master V5 Backend OK — Redis: {redis_status} — DB: PostgreSQL — Forex: {forex}"
 
-# ── PAGE DE CONTROLE : etat de l'entrepot en un coup d'oeil ──
-@app.route("/debug", methods=["GET"])
-def debug_status():
-    """Ouvre cette page dans le navigateur pour voir l'etat du systeme :
-    Redis connecte ? Combien de bougies stockees ? Quelle fraicheur ?"""
-    out = {"heure_paris": datetime.now(PARIS_TZ).strftime("%Y-%m-%d %H:%M:%S")}
-    conn = _get_redis()
-    out["redis_connecte"] = bool(conn)
-    inventaire = {}
-    try:
-        if conn:
-            for prefix in ["price", "candles", "m15", "daily"]:
-                keys = conn.keys(f"{prefix}:*")
-                detail = {}
-                for k in sorted(keys):
-                    try:
-                        d = json.loads(conn.get(k) or "{}")
-                        ts = d.get("received_ts")
-                        detail[k.split(":",1)[1]] = (str(int(time.time()-ts))+"s" if ts else "?")
-                    except Exception:
-                        detail[k.split(":",1)[1]] = "illisible"
-                inventaire[prefix] = {"total": len(keys), "age_par_symbole": detail}
-        else:
-            for name, ram in [("price", mt4_prices_ram), ("candles", mt4_candles_ram),
-                              ("m15", mt4_m15_ram), ("daily", mt4_daily_ram)]:
-                inventaire[name] = {"total": len(ram), "source": "RAM (Redis tombe)"}
-    except Exception as e:
-        out["erreur_inventaire"] = str(e)
-    out["inventaire"] = inventaire
-    out["aide"] = "age_par_symbole = anciennete du dernier envoi recu. Normal: <120s marche ouvert. Si ca grossit sans fin, le robot n'envoie plus."
-    return jsonify(out)
-
 # ── ETAT DU MARCHE (pour l'interface et l'Enqueteur) ─────────
 @app.route("/market-status", methods=["GET"])
 def market_status():
@@ -267,6 +202,49 @@ def market_status():
         "weekday": now.weekday(),
         "notice": None if opened else "Marche forex FERME — seules les cryptos sont analysables. Reouverture dimanche 23h Paris."
     })
+
+# ── MARKET_STATE (v7) ─────────────────────────────────────────
+# Source unique de verite : le robot MT4. Le backend ne recalcule RIEN,
+# il lit ce que le robot lui envoie avec chaque prix.
+@app.route("/regime/<symbol>", methods=["GET"])
+def get_regime(symbol):
+    key = symbol.upper().replace("/", "")
+    d = redis_get(f"price:{key}") or mt4_prices_ram.get(key)
+    if not d:
+        return jsonify({"symbol": key, "market_state": None,
+                        "erreur": "aucune donnee de prix pour cet instrument"}), 404
+    return jsonify({
+        "symbol": key,
+        "market_state": d.get("market_state"),
+        "regime_ratio": d.get("regime_ratio"),
+        "age_seconds": int(time.time() - d["received_ts"]) if d.get("received_ts") else None,
+        "source": "EA MT4 (source unique)"
+    })
+
+@app.route("/regimes", methods=["GET"])
+def get_all_regimes():
+    """Tableau de bord : le regime de tous les instruments connus."""
+    out = {}
+    for key in list(mt4_prices_ram.keys()):
+        d = mt4_prices_ram.get(key) or {}
+        if d.get("market_state"):
+            out[key] = {"market_state": d.get("market_state"),
+                        "ratio": d.get("regime_ratio")}
+    if r:
+        try:
+            for k in r.scan_iter("price:*"):
+                sym = k.split(":", 1)[1]
+                d = redis_get(k) or {}
+                if d.get("market_state"):
+                    out[sym] = {"market_state": d.get("market_state"),
+                                "ratio": d.get("regime_ratio")}
+        except Exception:
+            pass
+    resume = {}
+    for v in out.values():
+        etat = v.get("market_state") or "INCONNU"
+        resume[etat] = resume.get(etat, 0) + 1
+    return jsonify({"resume": resume, "instruments": out})
 
 # ── SOMMET DES TRADES (mesure trailing, v6) ───────────────────
 # Le robot envoie, pour chaque trade ferme, le profit MAX atteint (en R) et le
@@ -891,7 +869,7 @@ def receive_daily():
     if not data: return jsonify({"error": "JSON invalide"}), 400
     symbol = data.get("symbol","").upper().replace("/","")
     data = stamp(data)
-    if not redis_set(f"daily:{symbol}", data, ttl=DAILY_TTL): mt4_daily_ram[symbol] = data
+    if not redis_set(f"daily:{symbol}", data): mt4_daily_ram[symbol] = data
     print(f"Daily: {symbol} — {len(data.get('candles',[]))} bougies")
     return jsonify({"success": True})
 
@@ -919,6 +897,16 @@ def get_screenshot(symbol):
     return jsonify({"error": "Screenshot non disponible"}), 404
 
 # ── JOURNAL ───────────────────────────────────────────────────
+def _rapports_txt(rap):
+    """Serialise les rapports des agents, tronques pour rester leger en base."""
+    if not rap:
+        return None
+    try:
+        txt = rap if isinstance(rap, str) else json.dumps(rap, ensure_ascii=False)
+    except Exception:
+        return None
+    return txt[:12000]
+
 @app.route("/journal", methods=["POST"])
 def add_trade():
     data = request.get_json(force=True, silent=True)
@@ -929,8 +917,12 @@ def add_trade():
         c.execute('''INSERT INTO journal
             (date,pair,tf,session,score,decision,bias,entry,sl,tp,rr,
              resultat,contexte_marche,difficulte,pnl,commentaire,created_at,
-             direction_ok,entree_ok,sortie_ok,raison_sortie)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+             direction_ok,entree_ok,sortie_ok,raison_sortie,
+             market_state,regime_ratio,rsi_value,rsi_pente,
+             trap,cisd,msu,consensus_long,consensus_short,gate_blocked,
+             rapports_agents)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING id''',
             (data.get("date"),data.get("pair"),data.get("tf"),data.get("session"),
              data.get("score"),data.get("decision"),data.get("bias"),
@@ -938,7 +930,13 @@ def add_trade():
              data.get("resultat"),data.get("contexte_marche"),data.get("difficulte"),
              data.get("pnl"),data.get("commentaire"),datetime.now().isoformat(),
              data.get("direction_ok"),data.get("entree_ok"),
-             data.get("sortie_ok"),data.get("raison_sortie")))
+             data.get("sortie_ok"),data.get("raison_sortie"),
+             str(data.get("market_state") or ""), str(data.get("regime_ratio") or ""),
+             str(data.get("rsi_value") or ""), str(data.get("rsi_pente") or ""),
+             str(data.get("trap") or ""), str(data.get("cisd") or ""), str(data.get("msu") or ""),
+             str(data.get("consensus_long") or ""), str(data.get("consensus_short") or ""),
+             str(data.get("gate_blocked") or ""),
+             _rapports_txt(data.get("rapports_agents"))))
         conn.commit()
         trade_id = c.fetchone()["id"]
         conn.close()
@@ -988,15 +986,7 @@ def get_stats():
         c.execute("SELECT SUM(pnl) as s FROM journal WHERE pnl IS NOT NULL"); stats["total_pnl"] = round(c.fetchone()["s"] or 0, 2)
         c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat IS NOT NULL AND resultat!=''")
         done = c.fetchone()["n"]
-        # FIX WINRATE : le winrate ne doit compter QUE les trades reellement pris
-        # (win + loss + be). Avant, 'done' incluait aussi les 'nondeclenche', 'passe',
-        # etc., ce qui gonflait le denominateur et ecrasait le winrate (ex: 12% au lieu du vrai).
-        trades_pris = stats["wins"] + stats["losses"] + stats["be"]
-        stats["trades_pris"] = trades_pris
-        stats["winrate"] = round(stats["wins"]/trades_pris*100) if trades_pris > 0 else 0
-        # Compter les non-declenches a part (info utile, pas dans le winrate)
-        c.execute("SELECT COUNT(*) as n FROM journal WHERE resultat='nondeclenche'")
-        stats["non_declenches"] = c.fetchone()["n"]
+        stats["winrate"] = round(stats["wins"]/done*100) if done > 0 else 0
         for ctx in ["trend","range","manipulation"]:
             c.execute("SELECT COUNT(*) as n FROM journal WHERE contexte_marche=%s", (ctx,)); total_ctx = c.fetchone()["n"]
             c.execute("SELECT COUNT(*) as n FROM journal WHERE contexte_marche=%s AND resultat='win'", (ctx,)); wins_ctx = c.fetchone()["n"]
@@ -1012,6 +1002,236 @@ def get_stats():
         return jsonify(stats)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+# ══════════════════════════════════════════════════════════════
+# MEMOIRE (v8) — le carnet que les agents relisent avant de decider
+# Principe : retrouver les analyses PASSEES dans des conditions SEMBLABLES
+# et dire ce qu'elles ont donne. Pas d'apprentissage du modele : de la
+# consultation de notes. Comme un eleve qui a droit a son cahier.
+# ══════════════════════════════════════════════════════════════
+
+def _bilan(rows):
+    """Compte gagnants / perdants / neutres sur une liste de lignes."""
+    finis = [x for x in rows if (x.get("resultat") or "") in ("win", "loss", "be")]
+    n = len(finis)
+    if n == 0:
+        return None
+    w = sum(1 for x in finis if x["resultat"] == "win")
+    l = sum(1 for x in finis if x["resultat"] == "loss")
+    b = n - w - l
+    pnl = sum(float(x["pnl"]) for x in finis if x.get("pnl") is not None)
+    return {"n": n, "wins": w, "losses": l, "be": b,
+            "winrate": round(w / n * 100), "pnl": round(pnl, 2)}
+
+@app.route("/memoire/<path:pair>", methods=["GET"])
+def memoire(pair):
+    """
+    Ce que le systeme a deja vecu sur cette paire, dans ces conditions.
+    Parametres optionnels : market_state, trap, sens (long/short), rsi
+    """
+    p = pair.upper()
+    ms    = (request.args.get("market_state") or "").upper()
+    trap  = (request.args.get("trap") or "").lower()
+    sens  = (request.args.get("sens") or "").lower()
+    rsi   = request.args.get("rsi")
+
+    try:
+        conn = get_db(); c = conn.cursor()
+        c.execute("""SELECT * FROM journal
+                     WHERE pair = %s AND resultat IN ('win','loss','be')
+                     ORDER BY id DESC LIMIT 200""", (p,))
+        rows = [dict(x) for x in c.fetchall()]
+        conn.close()
+    except Exception as e:
+        return jsonify({"erreur": str(e)}), 500
+
+    out = {"paire": p, "conditions_demandees": {
+        "market_state": ms or None, "trap": trap or None,
+        "sens": sens or None, "rsi": rsi}}
+
+    # 1. Ce que vaut cette paire en general
+    out["global_paire"] = _bilan(rows)
+
+    # 2. Meme regime de marche
+    if ms:
+        same = [x for x in rows if (x.get("market_state") or "").upper() == ms]
+        out["meme_regime"] = _bilan(same)
+
+    # 3. Meme etat du TRAP  ← la regle la mieux prouvee du journal
+    if trap in ("true", "false", "oui", "non"):
+        veut = trap in ("true", "oui")
+        same = [x for x in rows
+                if str(x.get("trap") or "").lower() in (("true", "oui") if veut else ("false", "non"))]
+        out["meme_trap"] = _bilan(same)
+
+    # 4. Meme sens
+    if sens in ("long", "short"):
+        same = [x for x in rows if (x.get("bias") or "").lower() == sens]
+        out["meme_sens"] = _bilan(same)
+
+    # 5. Conditions CUMULEES : regime + trap + sens (le cas le plus proche)
+    cumul = rows
+    if ms:   cumul = [x for x in cumul if (x.get("market_state") or "").upper() == ms]
+    if trap in ("true", "false", "oui", "non"):
+        veut = trap in ("true", "oui")
+        cumul = [x for x in cumul
+                 if str(x.get("trap") or "").lower() in (("true", "oui") if veut else ("false", "non"))]
+    if sens in ("long", "short"):
+        cumul = [x for x in cumul if (x.get("bias") or "").lower() == sens]
+    out["cas_identiques"] = _bilan(cumul)
+    out["derniers_cas_identiques"] = [
+        {"id": x["id"], "date": x.get("date"), "resultat": x.get("resultat"),
+         "pnl": x.get("pnl"), "score": x.get("score"),
+         "market_state": x.get("market_state"), "trap": x.get("trap"),
+         "rsi": x.get("rsi_value"), "pente": x.get("rsi_pente"),
+         "difficulte": x.get("difficulte")}
+        for x in cumul[:5]]
+
+    # 6. Le verdict, en une phrase que les agents peuvent lire
+    b = out.get("cas_identiques") or out.get("meme_regime") or out.get("global_paire")
+    if not b:
+        out["verdict"] = "AUCUN PRECEDENT — premiere fois dans ces conditions. Prudence, pas d ajustement."
+    elif b["n"] < 5:
+        out["verdict"] = f"DONNEE INSUFFISANTE ({b['n']} cas) — ne pas ajuster le score."
+    elif b["winrate"] >= 65:
+        out["verdict"] = f"TERRAIN FAVORABLE : {b['winrate']}% sur {b['n']} cas ({b['pnl']} EUR). Bonus +2 justifie."
+    elif b["winrate"] <= 40:
+        out["verdict"] = f"TERRAIN DEFAVORABLE : {b['winrate']}% sur {b['n']} cas ({b['pnl']} EUR). Malus -2 justifie."
+    else:
+        out["verdict"] = f"NEUTRE : {b['winrate']}% sur {b['n']} cas. Pas d ajustement."
+
+    return jsonify(out)
+
+
+@app.route("/raisonnements/<path:pair>", methods=["GET"])
+def raisonnements(pair):
+    """
+    Ce que les agents avaient ECRIT lors des analyses passees sur cette paire,
+    avec le resultat obtenu. C'est le compte-rendu medical du patient.
+    Parametres : market_state, trap, sens, limit (defaut 5)
+    """
+    p = pair.upper()
+    ms   = (request.args.get("market_state") or "").upper()
+    trap = (request.args.get("trap") or "").lower()
+    sens = (request.args.get("sens") or "").lower()
+    try:
+        lim = int(request.args.get("limit", "5"))
+    except Exception:
+        lim = 5
+
+    SQL = ("SELECT id,date,pair,bias,score,resultat,pnl,difficulte,contexte_marche,"
+           "market_state,trap,rsi_value,rsi_pente,commentaire,rapports_agents "
+           "FROM journal WHERE pair = %s AND rapports_agents IS NOT NULL "
+           "ORDER BY id DESC LIMIT 200")
+    try:
+        conn = get_db(); c2 = conn.cursor()
+        c2.execute(SQL, (p,))
+        rows = [dict(x) for x in c2.fetchall()]
+        conn.close()
+    except Exception as e:
+        return jsonify({"erreur": str(e)}), 500
+
+    vrai = ("true", "oui", "1"); faux = ("false", "non", "0")
+    if ms:
+        rows = [x for x in rows if (x.get("market_state") or "").upper() == ms]
+    if trap in ("true", "false", "oui", "non"):
+        cible = vrai if trap in ("true", "oui") else faux
+        rows = [x for x in rows if str(x.get("trap") or "").lower() in cible]
+    if sens in ("long", "short"):
+        rows = [x for x in rows if (x.get("bias") or "").lower() == sens]
+
+    finis = [x for x in rows if (x.get("resultat") or "") in ("win", "loss", "be")]
+    out = []
+    for x in finis[:lim]:
+        try:
+            rap = json.loads(x.get("rapports_agents") or "{}")
+        except Exception:
+            rap = {"brut": (x.get("rapports_agents") or "")[:800]}
+        out.append({
+            "id": x["id"], "date": x.get("date"), "sens": x.get("bias"),
+            "score": x.get("score"), "resultat": x.get("resultat"), "pnl": x.get("pnl"),
+            "market_state": x.get("market_state"), "trap": x.get("trap"),
+            "rsi": x.get("rsi_value"), "pente": x.get("rsi_pente"),
+            "difficulte": x.get("difficulte"),
+            "rapports": rap
+        })
+    return jsonify({"paire": p, "nb_trouves": len(finis), "cas": out})
+
+
+@app.route("/memoire-globale", methods=["GET"])
+def memoire_globale():
+    """
+    Les grandes lecons du journal, toutes paires confondues.
+    C'est ici qu'on lit si le TRAP, le regime ou le RSI font une difference.
+    """
+    try:
+        conn = get_db(); c = conn.cursor()
+        c.execute("""SELECT * FROM journal WHERE resultat IN ('win','loss','be')
+                     ORDER BY id DESC LIMIT 500""")
+        rows = [dict(x) for x in c.fetchall()]
+        conn.close()
+    except Exception as e:
+        return jsonify({"erreur": str(e)}), 500
+
+    def sousgroupe(f):
+        return _bilan([x for x in rows if f(x)])
+
+    vrai = ("true", "oui", "1")
+    faux = ("false", "non", "0")
+
+    lecons = {
+        "TOTAL": _bilan(rows),
+        "TRAP_confirme":      sousgroupe(lambda x: str(x.get("trap") or "").lower() in vrai),
+        "TRAP_absent":        sousgroupe(lambda x: str(x.get("trap") or "").lower() in faux),
+        "regime_TENDANCE":    sousgroupe(lambda x: (x.get("market_state") or "").upper() == "TENDANCE"),
+        "regime_RANGE":       sousgroupe(lambda x: (x.get("market_state") or "").upper() == "RANGE"),
+        "regime_INDECIS":     sousgroupe(lambda x: (x.get("market_state") or "").upper() == "INDECIS"),
+        "marche_trend":       sousgroupe(lambda x: (x.get("contexte_marche") or "") == "trend"),
+        "marche_range":       sousgroupe(lambda x: (x.get("contexte_marche") or "") == "range"),
+        "marche_manipulation":sousgroupe(lambda x: (x.get("contexte_marche") or "") == "manipulation"),
+        "difficulte_easy":    sousgroupe(lambda x: (x.get("difficulte") or "") == "easy"),
+        "difficulte_medium":  sousgroupe(lambda x: (x.get("difficulte") or "") == "medium"),
+        "difficulte_hard":    sousgroupe(lambda x: (x.get("difficulte") or "") == "hard"),
+        "systeme_suivi_OUI":  sousgroupe(lambda x: (x.get("systeme_suivi") or "") == "oui"),
+        "systeme_suivi_NON":  sousgroupe(lambda x: (x.get("systeme_suivi") or "") == "non"),
+    }
+
+    # Pente RSI contraire au sens du trade — l'hypothese a mesurer
+    def pente_contraire(x, seuil):
+        try:
+            p = float(str(x.get("rsi_pente") or "").replace("+", ""))
+        except Exception:
+            return False
+        s = (x.get("bias") or "").lower()
+        if s == "short": return p >= seuil     # RSI monte alors qu'on vend
+        if s == "long":  return p <= -seuil    # RSI baisse alors qu'on achete
+        return False
+
+    lecons["pente_RSI_contraire_sup4"]  = sousgroupe(lambda x: pente_contraire(x, 4))
+    lecons["pente_RSI_contraire_inf4"]  = sousgroupe(
+        lambda x: (str(x.get("rsi_pente") or "") != "") and not pente_contraire(x, 4))
+
+    # Verdicts lisibles
+    verdicts = []
+    t_ok, t_no = lecons.get("TRAP_confirme"), lecons.get("TRAP_absent")
+    if t_ok and t_no and t_ok["n"] >= 5 and t_no["n"] >= 5:
+        verdicts.append(f"TRAP : {t_ok['winrate']}% avec ({t_ok['n']} cas) contre "
+                        f"{t_no['winrate']}% sans ({t_no['n']} cas). "
+                        f"Ecart {t_ok['winrate'] - t_no['winrate']} points.")
+    pc, pn = lecons.get("pente_RSI_contraire_sup4"), lecons.get("pente_RSI_contraire_inf4")
+    if pc and pn and pc["n"] >= 5 and pn["n"] >= 5:
+        verdicts.append(f"PENTE RSI contraire >4 : {pc['winrate']}% ({pc['n']} cas) contre "
+                        f"{pn['winrate']}% sinon ({pn['n']} cas).")
+    rt, rr = lecons.get("regime_TENDANCE"), lecons.get("regime_RANGE")
+    if rt and rr and rt["n"] >= 5 and rr["n"] >= 5:
+        verdicts.append(f"REGIME : TENDANCE {rt['winrate']}% ({rt['n']}) contre "
+                        f"RANGE {rr['winrate']}% ({rr['n']}).")
+    if not verdicts:
+        verdicts.append("Echantillon encore trop petit pour conclure (il faut 5+ cas par groupe).")
+
+    return jsonify({"lecons": lecons, "verdicts": verdicts,
+                    "note": "Un groupe avec moins de 5 cas ne prouve rien."})
+
 
 # ── JOURNAL CONTEXT POUR LES AGENTS ──────────────────────────
 @app.route("/journal/context", methods=["GET"])
@@ -1074,15 +1294,6 @@ def get_journal_context():
 
         ctx = f"HISTORIQUE TRADES REELS ({total_done} trades pris) :\n"
         ctx += f"- Winrate global : {winrate}% ({wins} wins / {losses} pertes)\n"
-        ctx += ("REGLE D'USAGE DE CES STATISTIQUES (obligatoire pour TOUS les agents) :\n"
-                "1) Ces stats servent a COMPRENDRE le contexte des pertes passees "
-                "(ex: pertes concentrees en RANGE ou sans TRAP confirme), PAS a punir "
-                "mecaniquement une paire ou une session.\n"
-                "2) SEUL l'Agent Memoire applique un bonus/malus historique (max ±1pt). "
-                "Les AUTRES agents (Liquidite, Structure, Zones, Timing, Risk, Backtest, Eco) "
-                "ne doivent appliquer AUCUN malus base sur ces winrates historiques — "
-                "ils analysent le marche ACTUEL uniquement. Tout double-comptage fausse le score.\n"
-                "3) Une stat sur N<10 trades est une indication, pas une loi.\n")
 
         if pairs_stats:
             ctx += "- Performance par paire :\n"
@@ -1096,9 +1307,6 @@ def get_journal_context():
             for m in marche_stats:
                 wr = round(m['wins']/m['total']*100) if m['total'] > 0 else 0
                 ctx += f"  {m['contexte_marche'].upper()} : {wr}% sur {m['total']} trades\n"
-            ctx += ("  LECTURE : c'est le TYPE DE MARCHE qui explique les pertes, pas la paire. "
-                    "Si RANGE affiche un winrate tres bas, la lecon est : eviter les entrees "
-                    "directionnelles en range — pas eviter telle paire ou telle session.\n")
 
         if session_stats:
             ctx += "- Performance par session :\n"
@@ -1162,6 +1370,103 @@ def get_journal_context():
                     ctx += f"\n{news_txt}"
             except:
                 pass
+
+        # ── MEMOIRE CIBLEE : ce qui s est passe dans CES conditions precises ──
+        if q_pair:
+            try:
+                c.execute("SELECT * FROM journal WHERE pair = %s AND resultat IN ('win','loss','be') ORDER BY id DESC LIMIT 200", (q_pair,))
+                hist = [dict(x) for x in c.fetchall()]
+                vrai = ("true", "oui", "1"); faux = ("false", "non", "0")
+
+                ctx += "\n\nMEMOIRE — " + q_pair + " :\n"
+                bg = _bilan(hist)
+                if bg:
+                    ctx += ("- Cette paire : %d%% sur %d trades (%s EUR cumules)\n"
+                            % (bg["winrate"], bg["n"], bg["pnl"]))
+                else:
+                    ctx += "- Aucun trade termine sur cette paire.\n"
+
+                if q_ms:
+                    sub = _bilan([x for x in hist if (x.get("market_state") or "").upper() == q_ms])
+                    if sub:
+                        ctx += ("- En regime %s : %d%% sur %d cas (%s EUR)\n"
+                                % (q_ms, sub["winrate"], sub["n"], sub["pnl"]))
+
+                if q_trap in ("true", "false", "oui", "non"):
+                    veut = q_trap in ("true", "oui")
+                    cible = vrai if veut else faux
+                    sub = _bilan([x for x in hist if str(x.get("trap") or "").lower() in cible])
+                    if sub:
+                        ctx += ("- Avec TRAP %s : %d%% sur %d cas (%s EUR)\n"
+                                % ("confirme" if veut else "ABSENT",
+                                   sub["winrate"], sub["n"], sub["pnl"]))
+
+                cum = hist
+                if q_ms:
+                    cum = [x for x in cum if (x.get("market_state") or "").upper() == q_ms]
+                if q_trap in ("true", "false", "oui", "non"):
+                    veut = q_trap in ("true", "oui"); cible = vrai if veut else faux
+                    cum = [x for x in cum if str(x.get("trap") or "").lower() in cible]
+                if q_sens in ("long", "short"):
+                    cum = [x for x in cum if (x.get("bias") or "").lower() == q_sens]
+
+                bc = _bilan(cum)
+                if bc:
+                    ctx += ("- CAS IDENTIQUES (meme regime + meme TRAP + meme sens) : "
+                            "%d%% sur %d cas (%s EUR)\n"
+                            % (bc["winrate"], bc["n"], bc["pnl"]))
+                    for x in cum[:3]:
+                        ctx += ("    %s : %s %s (score %s, %s)\n"
+                                % (x.get("date"), str(x.get("resultat") or "").upper(),
+                                   x.get("pnl") if x.get("pnl") is not None else "",
+                                   x.get("score"), x.get("difficulte") or "n/a"))
+                    if bc["n"] >= 5 and bc["winrate"] <= 40:
+                        ctx += ("  INSTRUCTION MEMOIRE : ces conditions ont majoritairement PERDU. "
+                                "Reduire le score de 2 points et exiger une confluence supplementaire.\n")
+                    elif bc["n"] >= 5 and bc["winrate"] >= 65:
+                        ctx += ("  INSTRUCTION MEMOIRE : ces conditions ont majoritairement GAGNE. "
+                                "Bonus de 2 points justifie.\n")
+                    else:
+                        ctx += "  INSTRUCTION MEMOIRE : echantillon insuffisant ou neutre, ne pas ajuster.\n"
+                else:
+                    ctx += "- Aucun precedent dans ces conditions exactes : PREMIERE FOIS. Prudence.\n"
+
+                # ── RELECTURE DU RAISONNEMENT PASSE ──
+                # Les agents relisent ce qu ils avaient ECRIT, avec le verdict.
+                # But : ne pas refaire le meme raisonnement errone deux fois.
+                avec_rap = [x for x in cum if x.get("rapports_agents")]
+                if avec_rap:
+                    ctx += "\nCE QUE TU AVAIS ECRIT DANS CES CONDITIONS :\n"
+                    for x in avec_rap[:2]:
+                        res = str(x.get("resultat") or "").upper()
+                        ctx += ("--- %s | %s | score %s | %s %s ---\n"
+                                % (x.get("date"), res, x.get("score"),
+                                   x.get("pnl") if x.get("pnl") is not None else "",
+                                   "EUR" if x.get("pnl") is not None else ""))
+                        try:
+                            rp = json.loads(x.get("rapports_agents") or "{}")
+                        except Exception:
+                            rp = {}
+                        if isinstance(rp, dict):
+                            for nom in ("liquidite", "structure", "zones", "timing",
+                                        "risk", "memoire", "backtest", "eco", "synthese",
+                                        "orchestrateur"):
+                                v = rp.get(nom)
+                                if not v:
+                                    continue
+                                if isinstance(v, dict):
+                                    concl = (v.get("conclusion") or v.get("resume")
+                                             or v.get("analyse") or "")
+                                else:
+                                    concl = str(v)
+                                concl = str(concl).replace("\n", " ")[:220]
+                                if concl:
+                                    ctx += "  %s : %s\n" % (nom.upper(), concl)
+                    ctx += ("  INSTRUCTION : relis ces raisonnements. Si tu t apprêtes a ecrire "
+                            "la meme chose sur un cas qui a PERDU, cherche ce qui avait ete "
+                            "manque a l epoque avant de valider.\n")
+            except Exception as e:
+                print("Memoire ciblee indisponible: %s" % e)
 
         conn.close()
         return jsonify({"context": ctx, "has_data": True, "total_trades": total_done})
