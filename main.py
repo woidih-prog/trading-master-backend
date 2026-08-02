@@ -156,7 +156,7 @@ def stamp(data):
 # Retard tolere, en minutes, avant de declarer les bougies gelees.
 LAG_MAX_H1    = 180    # 3 bougies H1 manquees
 LAG_MAX_M15   = 60     # 4 bougies M15 manquees
-LAG_MAX_DAILY = 4320   # 3 jours : doit survivre au week-end
+LAG_MAX_DAILY = 7200   # 3 jours : doit survivre au week-end
 
 def mt4_now(symbol):
     """Heure serveur MT4 pour ce symbole, lue sur le dernier prix recu."""
