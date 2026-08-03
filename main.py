@@ -143,45 +143,7 @@ def stamp(data):
     data["received_at"] = datetime.now(PARIS_TZ).strftime("%Y-%m-%d %H:%M:%S")
     return data
 
-# ── AGE REEL DES BOUGIES (et non age de la livraison) ────────
-# received_ts dit QUAND le colis est arrive. Il ne dit rien du CONTENU.
-# Si le graphique MT4 est gele, l'EA renvoie les memes vieilles bougies
-# toutes les 60s : age_seconds reste a 5s et stale reste False.
-# Preuve terrain : GBPCAD le 02/08, derniere bougie du 31/07 23h,
-# age_seconds = 78. Ecart reel : 26 heures.
-# Solution : comparer le "t" de la derniere bougie a l'heure MT4 prise sur
-# le dernier prix recu. Les deux horloges sont celles du broker, donc le
-# decalage GMT du serveur Admiral s'annule tout seul.
-
-# Retard tolere, en minutes, avant de declarer les bougies gelees.
-LAG_MAX_H1    = 180    # 3 bougies H1 manquees
-LAG_MAX_M15   = 60     # 4 bougies M15 manquees
-LAG_MAX_DAILY = 7200   # 3 jours : doit survivre au week-end
-
-def mt4_now(symbol):
-    """Heure serveur MT4 pour ce symbole, lue sur le dernier prix recu."""
-    p = redis_get(f"price:{symbol}") or mt4_prices_ram.get(symbol)
-    if not p:
-        return None
-    try:
-        return datetime.strptime(p.get("time", ""), "%Y.%m.%d %H:%M:%S")
-    except Exception:
-        return None
-
-def retard_bougies(symbol, data):
-    """Ecart en minutes entre l'heure MT4 et la derniere bougie recue.
-    None = impossible a calculer (pas de prix, pas de bougie, format inconnu)."""
-    candles = data.get("candles") or []
-    now_mt4 = mt4_now(symbol)
-    if not candles or not now_mt4:
-        return None
-    try:
-        t_last = datetime.strptime(candles[-1].get("t", ""), "%Y.%m.%d %H:%M:%S")
-    except Exception:
-        return None
-    return round((now_mt4 - t_last).total_seconds() / 60.0, 1)
-
-def enrich(data, symbol, lag_max_min=None):
+def enrich(data, symbol):
     """Ajoute age, fraicheur et etat du marche sur une donnee renvoyee."""
     out = dict(data)
     opened = market_open_for(symbol)
@@ -196,13 +158,6 @@ def enrich(data, symbol, lag_max_min=None):
     else:
         out["age_seconds"] = None
         out["stale"] = None
-    # Age REEL du contenu, pas de la livraison.
-    if "candles" in out:
-        lag = retard_bougies(symbol, out)
-        out["retard_minutes"] = lag
-        seuil = lag_max_min if lag_max_min else LAG_MAX_H1
-        out["retard_max_minutes"] = seuil
-        out["bougies_gelees"] = bool(opened and lag is not None and lag > seuil)
     if not opened:
         out["market_notice"] = "MARCHE FERME — donnees figees (week-end forex). Reouverture dimanche 23h Paris."
     return out
@@ -235,7 +190,7 @@ def init_db():
         # + orchestrateur. Sans lui, chaque analyse repartait de zero.
         for col in ['direction_ok','entree_ok','sortie_ok','raison_sortie','systeme_suivi',
                     'rapports_agents','market_state','regime_ratio','rsi_value','rsi_pente',
-                    'trap','cisd','msu','consensus_long','consensus_short','gate_blocked']:
+                    'trap','cisd','msu','consensus_long','consensus_short','gate_blocked','lecon']:
             try:
                 c.execute(f"ALTER TABLE journal ADD COLUMN IF NOT EXISTS {col} TEXT")
                 conn.commit()
@@ -249,6 +204,53 @@ def init_db():
         print(f"PostgreSQL erreur: {e}")
 
 init_db()
+
+# ── GENERATEUR DE LECON (v7) ──────────────────────────────────
+# Transforme chaque trade en enseignement exploitable, base sur les CAUSES
+# (TRAP, CISD, regime, pente RSI) et JAMAIS sur la paire. Une lecon du type
+# "EUR/USD perd, j'evite EUR/USD" serait une conclusion, pas une cause.
+def generer_lecon(t):
+    res  = (t.get("resultat") or "").lower()
+    trap = str(t.get("trap") or "").lower() in ("true","1","oui")
+    cisd = str(t.get("cisd") or "").lower() in ("true","1","oui")
+    msu  = str(t.get("msu") or "").lower() in ("true","1","oui")
+    ms   = (t.get("market_state") or t.get("contexte_marche") or "").upper()
+    try:    pente = float(t.get("rsi_pente")) if t.get("rsi_pente") not in (None,"","None") else None
+    except Exception: pente = None
+    biais  = (t.get("bias") or "").lower()
+    sortie = (t.get("sortie_ok") or "")
+
+    causes = []
+    if not trap: causes.append("TRAP non confirme")
+    if not cisd: causes.append("CISD absent")
+    if not msu:  causes.append("MSU absent")
+    if ms in ("RANGE","MANIPULATION"): causes.append("marche en " + ms)
+    if pente is not None and abs(pente) >= 3:
+        sens_p = "haussiere" if pente > 0 else "baissiere"
+        contre = (pente > 0 and biais == "short") or (pente < 0 and biais == "long")
+        if contre:
+            causes.append("pente RSI %s de %+.1f contraire au sens du trade" % (sens_p, pente))
+
+    presents = []
+    if trap: presents.append("TRAP confirme")
+    if cisd: presents.append("CISD present")
+    if msu:  presents.append("MSU detecte")
+
+    if res == "win":
+        base = " + ".join(presents) if presents else "contexte favorable"
+        l = "WIN — " + base + " : schema a reconnaitre."
+        if causes:
+            l += " A noter : " + ", ".join(causes) + " n'ont pas empeche le gain — ces facteurs seuls ne suffisent pas a invalider un setup."
+        return l
+    if res == "loss":
+        if causes:
+            return "LOSS — declencheurs manquants a l'entree : " + ", ".join(causes) + ". Verifier leur presence AVANT de valider un setup semblable."
+        return "LOSS — tous les declencheurs etaient presents. L'echec vient de l'execution ou de la gestion, pas de la lecture du marche."
+    if res == "be":
+        if "be_force" in sortie:
+            return "BE — direction correcte, sortie anticipee. Le probleme est la gestion, pas la lecture."
+        return "BE — lecture correcte mais mouvement insuffisant. Verifier si le TP etait atteignable dans ce contexte."
+    return ""
 
 # ── HELPERS TELEGRAM ──────────────────────────────────────────
 def send_tg(chat_id, text, reply_markup=None):
@@ -287,19 +289,12 @@ def debug_status():
                 keys = conn.keys(f"{prefix}:*")
                 detail = {}
                 for k in sorted(keys):
-                    sym = k.split(":",1)[1]
                     try:
                         d = json.loads(conn.get(k) or "{}")
                         ts = d.get("received_ts")
-                        txt = (str(int(time.time()-ts))+"s" if ts else "?")
-                        # Age REEL du contenu, affiche a cote de l'age de la livraison.
-                        if "candles" in d:
-                            lag = retard_bougies(sym, d)
-                            if lag is not None:
-                                txt += f" | derniere bougie: {int(lag)}min"
-                        detail[sym] = txt
+                        detail[k.split(":",1)[1]] = (str(int(time.time()-ts))+"s" if ts else "?")
                     except Exception:
-                        detail[sym] = "illisible"
+                        detail[k.split(":",1)[1]] = "illisible"
                 inventaire[prefix] = {"total": len(keys), "age_par_symbole": detail}
         else:
             for name, ram in [("price", mt4_prices_ram), ("candles", mt4_candles_ram),
@@ -308,10 +303,7 @@ def debug_status():
     except Exception as e:
         out["erreur_inventaire"] = str(e)
     out["inventaire"] = inventaire
-    out["aide"] = ("age_par_symbole = anciennete du dernier ENVOI recu (normal: <120s marche ouvert ; "
-                   "si ca grossit sans fin, le robot n'envoie plus). "
-                   "'derniere bougie' = age REEL du contenu (normal H1: <180min, M15: <60min, Daily: <4320min ; "
-                   "si ca grossit alors que l'envoi reste frais, le graphique MT4 est gele).")
+    out["aide"] = "age_par_symbole = anciennete du dernier envoi recu. Normal: <120s marche ouvert. Si ca grossit sans fin, le robot n'envoie plus."
     return jsonify(out)
 
 # ── ETAT DU MARCHE (pour l'interface et l'Enqueteur) ─────────
@@ -737,6 +729,18 @@ def telegram_webhook():
                 c.execute("UPDATE journal SET resultat=%s, contexte_marche=%s, difficulte=%s WHERE id=%s",
                     (resultat, contexte, difficulte, int(trade_id)))
                 conn.commit()
+                # v7 : generer la LECON (causale) des que le verdict est connu
+                try:
+                    c.execute("SELECT * FROM journal WHERE id=%s", (int(trade_id),))
+                    row = c.fetchone()
+                    if row:
+                        lec = generer_lecon(dict(row))
+                        if lec:
+                            c.execute("UPDATE journal SET lecon=%s WHERE id=%s", (lec, int(trade_id)))
+                            conn.commit()
+                            print(f"Lecon #{trade_id}: {lec}")
+                except Exception as e:
+                    conn.rollback(); print(f"Lecon erreur: {e}")
                 conn.close()
                 print(f"Journal mis a jour: trade #{trade_id} = {resultat} / {contexte} / {difficulte}")
             except Exception as e:
@@ -919,7 +923,7 @@ def receive_candles():
 def get_candles(symbol):
     key = symbol.upper().replace("/","")
     data = redis_get(f"candles:{key}") or mt4_candles_ram.get(key)
-    if data: return jsonify(enrich(data, key, LAG_MAX_H1))
+    if data: return jsonify(enrich(data, key))
     return jsonify({"error": "Bougies non disponibles", "market_open": market_open_for(key)}), 404
 
 # ── BOUGIES M15 ───────────────────────────────────────────────
@@ -940,7 +944,7 @@ def receive_m15():
 def get_m15(symbol):
     key = symbol.upper().replace("/","")
     data = redis_get(f"m15:{key}") or mt4_m15_ram.get(key)
-    if data: return jsonify(enrich(data, key, LAG_MAX_M15))
+    if data: return jsonify(enrich(data, key))
     return jsonify({"error": "Bougies M15 non disponibles", "market_open": market_open_for(key)}), 404
 
 # ── BOUGIES DAILY ─────────────────────────────────────────────
@@ -958,7 +962,7 @@ def receive_daily():
 def get_daily(symbol):
     key = symbol.upper().replace("/","")
     data = redis_get(f"daily:{key}") or mt4_daily_ram.get(key)
-    if data: return jsonify(enrich(data, key, LAG_MAX_DAILY))
+    if data: return jsonify(enrich(data, key))
     return jsonify({"error": "Daily non disponible", "market_open": market_open_for(key)}), 404
 
 # ── SCREENSHOT ────────────────────────────────────────────────
@@ -1280,6 +1284,21 @@ def get_journal_context():
                         "chose sur un cas qui a PERDU, cherche ce qui avait ete manque a l'epoque "
                         "avant de valider. Si le cas avait GAGNE, verifie que les memes conditions "
                         "sont reellement presentes aujourd'hui — ne les suppose pas.\n")
+            # ── BIBLIOTHEQUE DE LECONS (v7) ────────────────────────
+            # Chaque trade devient une regle exploitable, formulee en CAUSES.
+            c.execute("SELECT lecon, resultat FROM journal WHERE lecon IS NOT NULL "
+                      "AND lecon <> '' ORDER BY id DESC LIMIT 12")
+            lecons = c.fetchall()
+            if lecons:
+                ctx += "\nLECONS TIREES DES TRADES PRECEDENTS :\n"
+                for l in lecons:
+                    ctx += f"  - {l['lecon']}\n"
+                ctx += ("  REGLE DE LECTURE OBLIGATOIRE : apprends des CAUSES, jamais des CONCLUSIONS.\n"
+                        "  INTERDIT : 'cette paire a perdu, donc je l'evite' — c'est une conclusion, "
+                        "elle ne dit rien du marche d'aujourd'hui.\n"
+                        "  CORRECT : 'il manquait TRAP et CISD la derniere fois ; sont-ils presents "
+                        "MAINTENANT ? Si oui, le setup est valide malgre l'echec passe. Si non, prudence.'\n"
+                        "  Une paire n'est jamais coupable. Ce sont les declencheurs absents qui le sont.\n")
         except Exception as e:
             print(f"Memoire raisonnements: {e}")
 
@@ -1288,6 +1307,26 @@ def get_journal_context():
     except Exception as e:
         print(f"Erreur journal/context: {e}")
         return jsonify({"context": "", "has_data": False})
+
+@app.route("/lecons", methods=["GET"])
+def lecons():
+    """Bibliotheque des enseignements. Filtres: ?resultat=loss"""
+    try:
+        conn = get_db(); c = conn.cursor()
+        sql = ("SELECT id, date, pair, resultat, score, pnl, market_state, lecon "
+               "FROM journal WHERE lecon IS NOT NULL AND lecon <> '' ")
+        params = []
+        if request.args.get("resultat"):
+            sql += "AND resultat = %s "; params.append(request.args.get("resultat"))
+        if request.args.get("pair"):
+            sql += "AND pair = %s "; params.append(request.args.get("pair"))
+        sql += "ORDER BY id DESC LIMIT 100"
+        c.execute(sql, tuple(params))
+        rows = [dict(r) for r in c.fetchall()]
+        conn.close()
+        return jsonify({"total": len(rows), "lecons": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/raisonnements", methods=["GET"])
 def raisonnements():
