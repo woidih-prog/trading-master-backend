@@ -1357,6 +1357,198 @@ def raisonnements():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ══════════════════════════════════════════════════════════════
+# SURVEILLANCE DES SIGNAUX BLOQUES (v8)
+# Un signal ATTENDRE disparaissait sans qu'on sache si le blocage
+# etait justifie. Desormais il est SUIVI : verification legere toutes
+# les 30 min (aucun appel IA), abandon a 4h, et TOUT est journalise.
+# ══════════════════════════════════════════════════════════════
+SIGNAUX_SURVEILLES = {}          # trade_id -> dict
+SURVEILLANCE_MINUTES = 30        # frequence de verification
+SURVEILLANCE_MAX_HEURES = 4      # au-dela : abandon (aligne sur MT4)
+
+def _fichier_surv():
+    return "/tmp/signaux_surveilles.json"
+
+def _charger_surveillance():
+    global SIGNAUX_SURVEILLES
+    try:
+        if os.path.exists(_fichier_surv()):
+            with open(_fichier_surv()) as f:
+                SIGNAUX_SURVEILLES = json.load(f)
+    except Exception:
+        SIGNAUX_SURVEILLES = {}
+
+def _sauver_surveillance():
+    try:
+        with open(_fichier_surv(), "w") as f:
+            json.dump(SIGNAUX_SURVEILLES, f)
+    except Exception:
+        pass
+
+_charger_surveillance()
+
+@app.route("/surveiller", methods=["POST"])
+def surveiller():
+    """La page enregistre ici chaque signal bloque (ATTENDRE)."""
+    d = request.get_json(force=True, silent=True) or {}
+    tid = str(d.get("trade_id") or int(time.time()))
+    SIGNAUX_SURVEILLES[tid] = {
+        "trade_id": tid,
+        "pair": d.get("pair"),
+        "symbol": (d.get("pair") or "").replace("/", ""),
+        "mt4_symbol": d.get("mt4_symbol"),
+        "bias": d.get("bias"),
+        "entry": d.get("entry"),
+        "sl": d.get("sl"),
+        "tp": d.get("tp"),
+        "score": d.get("score"),
+        "raison_blocage": d.get("raison_blocage"),
+        "consensus_long": d.get("consensus_long"),
+        "consensus_short": d.get("consensus_short"),
+        "market_state": d.get("market_state"),
+        "rsi_value": d.get("rsi_value"),
+        "rsi_pente": d.get("rsi_pente"),
+        "cree_ts": time.time(),
+        "cree_le": datetime.now(PARIS_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+        "verifications": 0,
+        "statut": "EN_SURVEILLANCE"
+    }
+    _sauver_surveillance()
+    print(f"Surveillance ouverte : {d.get('pair')} #{tid}")
+    return jsonify({"ok": True, "surveilles": len(SIGNAUX_SURVEILLES)})
+
+@app.route("/surveilles", methods=["GET"])
+def liste_surveilles():
+    """Consulter les signaux en cours de surveillance."""
+    out = []
+    for v in SIGNAUX_SURVEILLES.values():
+        v2 = dict(v)
+        v2["age_minutes"] = round((time.time() - v.get("cree_ts", 0)) / 60)
+        out.append(v2)
+    out.sort(key=lambda x: x.get("cree_ts", 0), reverse=True)
+    return jsonify({"total": len(out), "signaux": out})
+
+def _prix_actuel(sig):
+    """Prix live du symbole, ou None."""
+    for key in [sig.get("mt4_symbol"), sig.get("symbol")]:
+        if not key:
+            continue
+        d = redis_get(f"price:{key.upper()}") or mt4_prices_ram.get(key.upper())
+        if d and d.get("bid"):
+            try:
+                return float(d["bid"]), d
+            except Exception:
+                pass
+    return None, None
+
+def verifier_un_signal(tid, sig):
+    """Verification LEGERE : aucun appel IA. Renvoie (statut, message)."""
+    age_h = (time.time() - sig.get("cree_ts", 0)) / 3600.0
+    prix, data = _prix_actuel(sig)
+
+    if prix is None:
+        return ("EN_SURVEILLANCE", None)   # pas de prix : on reessaiera
+
+    try:
+        entry = float(sig.get("entry"))
+        sl    = float(sig.get("sl"))
+        tp    = float(sig.get("tp"))
+    except Exception:
+        return ("ABANDON", "niveaux illisibles")
+
+    est_long = (sig.get("bias") == "long")
+
+    # 1) Le train est parti : le prix a depasse le TP sans nous
+    if (est_long and prix >= tp) or (not est_long and prix <= tp):
+        return ("ABANDON_TP_ATTEINT",
+                f"le prix a atteint le TP ({tp}) sans nous — blocage COUTEUX")
+
+    # 2) Setup mort : le prix a depasse le SL
+    if (est_long and prix <= sl) or (not est_long and prix >= sl):
+        return ("ABANDON_SL_DEPASSE",
+                f"le prix a depasse le SL ({sl}) — blocage JUSTIFIE, perte evitee")
+
+    # 3) Le regime a-t-il change en notre faveur ?
+    regime_now = (data or {}).get("market_state")
+    regime_avant = sig.get("market_state")
+    aligne = False
+    if regime_now:
+        if est_long and regime_now in ("TENDANCE", "TREND_UP"):
+            aligne = True
+        if (not est_long) and regime_now in ("TENDANCE", "TREND_DOWN"):
+            aligne = True
+    if aligne and regime_now != regime_avant:
+        return ("RELANCER",
+                f"le regime est passe a {regime_now}, aligne avec le sens — relance une analyse")
+
+    # 4) Trop vieux
+    if age_h >= SURVEILLANCE_MAX_HEURES:
+        dist = abs(prix - entry)
+        return ("ABANDON_EXPIRE",
+                f"{SURVEILLANCE_MAX_HEURES}h sans declenchement (prix a {round(dist,5)} de l'entree)")
+
+    return ("EN_SURVEILLANCE", None)
+
+def journaliser_surveillance(sig, statut, message):
+    """Ecrit l'issue dans le journal — meme tracabilite que les trades pris."""
+    try:
+        conn = get_db(); c = conn.cursor()
+        commentaire = f"SIGNAL BLOQUE — {statut}. {message or ''} " \
+                      f"(blocage initial : {sig.get('raison_blocage') or 'consensus faible'})"
+        c.execute("""UPDATE journal SET resultat=%s, commentaire=%s, raison_sortie=%s
+                     WHERE id=%s""",
+                  ("signal_bloque", commentaire[:900], statut, int(sig["trade_id"])))
+        conn.commit(); conn.close()
+        print(f"Surveillance journalisee #{sig['trade_id']} : {statut}")
+    except Exception as e:
+        print(f"Surveillance journal erreur: {e}")
+
+def surveillance_job():
+    """Tourne en fond : verifie les signaux bloques toutes les X minutes."""
+    while True:
+        try:
+            time.sleep(SURVEILLANCE_MINUTES * 60)
+            if not SIGNAUX_SURVEILLES:
+                continue
+            a_retirer = []
+            for tid, sig in list(SIGNAUX_SURVEILLES.items()):
+                statut, message = verifier_un_signal(tid, sig)
+                sig["verifications"] = sig.get("verifications", 0) + 1
+                sig["derniere_verif"] = datetime.now(PARIS_TZ).strftime("%H:%M")
+
+                if statut == "EN_SURVEILLANCE":
+                    continue
+
+                # Issue trouvee : on notifie, on journalise, on retire
+                age_min = round((time.time() - sig.get("cree_ts", 0)) / 60)
+                icone = {"RELANCER": "🔄", "ABANDON_TP_ATTEINT": "⚠️",
+                         "ABANDON_SL_DEPASSE": "✅", "ABANDON_EXPIRE": "⏰",
+                         "ABANDON": "❌"}.get(statut, "ℹ️")
+                txt = (f"{icone} SIGNAL SURVEILLE — {sig.get('pair')}\n"
+                       f"Bloque il y a {age_min} min (score {sig.get('score')})\n"
+                       f"{message}\n")
+                if statut == "RELANCER":
+                    txt += "\n👉 Relance une analyse sur cette paire."
+                elif statut == "ABANDON_SL_DEPASSE":
+                    txt += "\nLe systeme a eu RAISON de bloquer."
+                elif statut == "ABANDON_TP_ATTEINT":
+                    txt += "\nLe systeme a eu TORT de bloquer — gain manque."
+                try:
+                    send_tg(TELEGRAM_CHAT_ID, txt)
+                except Exception:
+                    pass
+                journaliser_surveillance(sig, statut, message)
+                a_retirer.append(tid)
+
+            for tid in a_retirer:
+                SIGNAUX_SURVEILLES.pop(tid, None)
+            _sauver_surveillance()
+        except Exception as e:
+            print(f"Surveillance erreur: {e}")
+
+threading.Thread(target=surveillance_job, daemon=True).start()
+
 # ── SCHEDULER ─────────────────────────────────────────────────
 def scheduler_job():
     # Aligne sur la discipline de trading :
