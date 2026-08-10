@@ -1468,6 +1468,67 @@ def _prix_actuel(sig):
                 pass
     return None, None
 
+def _rsi_actuel(sig, period=14):
+    """RSI(14) Wilder sur les bougies H1 en cache. None si indisponible."""
+    for key in [sig.get("mt4_symbol"), sig.get("symbol")]:
+        if not key:
+            continue
+        d = redis_get(f"candles:{key.upper()}") or mt4_candles_ram.get(key.upper())
+        if not d:
+            continue
+        try:
+            closes = [float(c["c"]) for c in d.get("candles", [])]
+            if len(closes) < period + 1:
+                continue
+            gains = losses = 0.0
+            for i in range(1, period + 1):
+                delta = closes[i] - closes[i-1]
+                if delta > 0: gains += delta
+                else:         losses -= delta
+            avg_g, avg_l = gains / period, losses / period
+            for i in range(period + 1, len(closes)):
+                delta = closes[i] - closes[i-1]
+                avg_g = (avg_g * (period - 1) + (delta if delta > 0 else 0)) / period
+                avg_l = (avg_l * (period - 1) + (-delta if delta < 0 else 0)) / period
+            if avg_l == 0:
+                return 100.0
+            return 100 - (100 / (1 + avg_g / avg_l))
+        except Exception:
+            continue
+    return None
+
+def motif_toujours_actif(sig):
+    """Le motif du blocage est-il TOUJOURS present ?
+    Renvoie (actif, explication).
+
+    FIX 10/08 : la surveillance proposait une relance des que le regime
+    s'alignait, SANS verifier si la cause du blocage avait disparu. Cas reel
+    (GBP/JPY) : bloque a RSI 81,1 ; notification de relance envoyee alors que
+    le RSI etait monte a 82,18 — la cause s'etait AGGRAVEE. Le message ne
+    montrait que ce qui s'etait ameliore."""
+    raison = (sig.get("raison_blocage") or "").upper()
+
+    # Blocage par la boussole RSI : verifiable sans appel IA
+    if "RSI" in raison or "BOUSSOLE" in raison:
+        rsi = _rsi_actuel(sig)
+        if rsi is None:
+            return (True, "RSI non recalculable — motif suppose toujours actif")
+        if rsi >= 68 or rsi <= 32:
+            depart = sig.get("rsi_value")
+            dep_txt = f" (etait a {round(float(depart),1)})" if depart else ""
+            return (True, f"RSI toujours en zone extreme : {round(rsi,1)}{dep_txt}")
+        return (False, f"RSI revenu en zone neutre : {round(rsi,1)}")
+
+    # Contradiction entre agents : NON verifiable sans refaire tourner les 8 agents
+    if "CONTRADICTION" in raison:
+        return (True, "contradiction entre agents — non verifiable sans nouvelle analyse")
+
+    # Score sous le seuil : depend des 8 agents, donc non verifiable ici
+    if "SCORE" in raison:
+        return (True, "score sous seuil — a reevaluer par une analyse complete")
+
+    return (False, "")
+
 def verifier_un_signal(tid, sig):
     """Verification LEGERE : aucun appel IA. Renvoie (statut, message)."""
     age_h = (time.time() - sig.get("cree_ts", 0)) / 3600.0
@@ -1505,8 +1566,15 @@ def verifier_un_signal(tid, sig):
         if (not est_long) and regime_now in ("TENDANCE", "TREND_DOWN"):
             aligne = True
     if aligne and regime_now != regime_avant:
+        # FIX 10/08 : ne proposer une relance QUE si le motif du blocage est leve.
+        encore, explication = motif_toujours_actif(sig)
+        if encore:
+            # Le contexte s'ameliore mais la cause demeure : on informe sans inviter.
+            return ("EN_SURVEILLANCE_MOTIF_ACTIF",
+                    f"regime passe a {regime_now} (aligne) MAIS blocage maintenu — {explication}")
         return ("RELANCER",
-                f"le regime est passe a {regime_now}, aligne avec le sens — relance une analyse")
+                f"le regime est passe a {regime_now} et le motif du blocage est leve"
+                + (f" ({explication})" if explication else "") + " — relance une analyse")
 
     # 4) Trop vieux
     if age_h >= SURVEILLANCE_MAX_HEURES:
@@ -1554,6 +1622,23 @@ def verifier_signaux_en_attente(force=False):
 
             if statut == "EN_SURVEILLANCE":
                 _ecrire_surveillance(tid, sig)      # on garde le compteur a jour
+                continue
+
+            # Motif encore actif : on informe UNE SEULE FOIS, puis on continue
+            # de surveiller. Pas d'invitation a relancer, pas de sortie du suivi.
+            if statut == "EN_SURVEILLANCE_MOTIF_ACTIF":
+                if not sig.get("info_motif_envoyee"):
+                    age_m = round((maintenant - sig.get("cree_ts", 0)) / 60)
+                    txt = ("SURVEILLANCE - CONTEXTE AMELIORE MAIS BLOCAGE MAINTENU\n"
+                           + str(sig.get("pair") or "?") + " | bloque il y a " + str(age_m) + " min\n"
+                           + str(message) + "\n"
+                           + "-> Ne pas relancer : la cause du blocage est toujours la.")
+                    try:
+                        send_tg(TELEGRAM_CHAT_ID, txt)
+                    except Exception as e:
+                        print(f"Surveillance Telegram: {e}")
+                    sig["info_motif_envoyee"] = True
+                _ecrire_surveillance(tid, sig)
                 continue
 
             age_min = round((maintenant - sig.get("cree_ts", 0)) / 60)
