@@ -1363,37 +1363,62 @@ def raisonnements():
 # etait justifie. Desormais il est SUIVI : verification legere toutes
 # les 30 min (aucun appel IA), abandon a 4h, et TOUT est journalise.
 # ══════════════════════════════════════════════════════════════
-SIGNAUX_SURVEILLES = {}          # trade_id -> dict
 SURVEILLANCE_MINUTES = 30        # frequence de verification
 SURVEILLANCE_MAX_HEURES = 4      # au-dela : abandon (aligne sur MT4)
 
-def _fichier_surv():
-    return "/tmp/signaux_surveilles.json"
-
-def _charger_surveillance():
-    global SIGNAUX_SURVEILLES
+# v8.1 : stockage en BASE, plus dans /tmp.
+# /tmp est efface a chaque redeploiement Render, et le thread de fond mourait
+# pendant les mises en veille -> aucune verification pendant toute une nuit.
+def _init_table_surveillance():
     try:
-        if os.path.exists(_fichier_surv()):
-            with open(_fichier_surv()) as f:
-                SIGNAUX_SURVEILLES = json.load(f)
-    except Exception:
-        SIGNAUX_SURVEILLES = {}
+        conn = get_db(); c = conn.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS surveillance (
+            trade_id TEXT PRIMARY KEY,
+            donnees TEXT,
+            cree_ts DOUBLE PRECISION,
+            statut TEXT
+        )""")
+        conn.commit(); conn.close()
+        print("Table surveillance OK")
+    except Exception as e:
+        print(f"Table surveillance erreur: {e}")
 
-def _sauver_surveillance():
+_init_table_surveillance()
+
+def _lire_surveillance():
+    """Renvoie les signaux encore EN_SURVEILLANCE, depuis la base."""
+    out = {}
     try:
-        with open(_fichier_surv(), "w") as f:
-            json.dump(SIGNAUX_SURVEILLES, f)
-    except Exception:
-        pass
+        conn = get_db(); c = conn.cursor()
+        c.execute("SELECT trade_id, donnees FROM surveillance WHERE statut='EN_SURVEILLANCE'")
+        for row in c.fetchall():
+            try:
+                out[row["trade_id"]] = json.loads(row["donnees"])
+            except Exception:
+                pass
+        conn.close()
+    except Exception as e:
+        print(f"Lecture surveillance: {e}")
+    return out
 
-_charger_surveillance()
+def _ecrire_surveillance(tid, sig, statut="EN_SURVEILLANCE"):
+    try:
+        conn = get_db(); c = conn.cursor()
+        c.execute("""INSERT INTO surveillance (trade_id, donnees, cree_ts, statut)
+                     VALUES (%s,%s,%s,%s)
+                     ON CONFLICT (trade_id) DO UPDATE
+                     SET donnees=EXCLUDED.donnees, statut=EXCLUDED.statut""",
+                  (str(tid), json.dumps(sig), sig.get("cree_ts", time.time()), statut))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"Ecriture surveillance: {e}")
 
 @app.route("/surveiller", methods=["POST"])
 def surveiller():
     """La page enregistre ici chaque signal bloque (ATTENDRE)."""
     d = request.get_json(force=True, silent=True) or {}
     tid = str(d.get("trade_id") or int(time.time()))
-    SIGNAUX_SURVEILLES[tid] = {
+    sig = {
         "trade_id": tid,
         "pair": d.get("pair"),
         "symbol": (d.get("pair") or "").replace("/", ""),
@@ -1414,15 +1439,16 @@ def surveiller():
         "verifications": 0,
         "statut": "EN_SURVEILLANCE"
     }
-    _sauver_surveillance()
+    _ecrire_surveillance(tid, sig)
     print(f"Surveillance ouverte : {d.get('pair')} #{tid}")
-    return jsonify({"ok": True, "surveilles": len(SIGNAUX_SURVEILLES)})
+    return jsonify({"ok": True})
 
 @app.route("/surveilles", methods=["GET"])
 def liste_surveilles():
     """Consulter les signaux en cours de surveillance."""
+    verifier_signaux_en_attente()          # v8.1 : on verifie au passage
     out = []
-    for v in SIGNAUX_SURVEILLES.values():
+    for v in _lire_surveillance().values():
         v2 = dict(v)
         v2["age_minutes"] = round((time.time() - v.get("cree_ts", 0)) / 60)
         out.append(v2)
@@ -1504,50 +1530,82 @@ def journaliser_surveillance(sig, statut, message):
     except Exception as e:
         print(f"Surveillance journal erreur: {e}")
 
-def surveillance_job():
-    """Tourne en fond : verifie les signaux bloques toutes les X minutes."""
-    while True:
+_derniere_verif_surv = 0.0
+
+def verifier_signaux_en_attente(force=False):
+    """v8.1 : appelee A CHAQUE REQUETE (pas un thread de fond, qui mourait
+    pendant les mises en veille de Render). On ne verifie qu'une fois toutes
+    les SURVEILLANCE_MINUTES pour ne pas surcharger."""
+    global _derniere_verif_surv
+    maintenant = time.time()
+    if not force and (maintenant - _derniere_verif_surv) < SURVEILLANCE_MINUTES * 60:
+        return
+    _derniere_verif_surv = maintenant
+
+    signaux = _lire_surveillance()
+    if not signaux:
+        return
+
+    for tid, sig in signaux.items():
         try:
-            time.sleep(SURVEILLANCE_MINUTES * 60)
-            if not SIGNAUX_SURVEILLES:
+            statut, message = verifier_un_signal(tid, sig)
+            sig["verifications"] = sig.get("verifications", 0) + 1
+            sig["derniere_verif"] = datetime.now(PARIS_TZ).strftime("%d/%m %H:%M")
+
+            if statut == "EN_SURVEILLANCE":
+                _ecrire_surveillance(tid, sig)      # on garde le compteur a jour
                 continue
-            a_retirer = []
-            for tid, sig in list(SIGNAUX_SURVEILLES.items()):
-                statut, message = verifier_un_signal(tid, sig)
-                sig["verifications"] = sig.get("verifications", 0) + 1
-                sig["derniere_verif"] = datetime.now(PARIS_TZ).strftime("%H:%M")
 
-                if statut == "EN_SURVEILLANCE":
-                    continue
+            age_min = round((maintenant - sig.get("cree_ts", 0)) / 60)
+            entete = {"RELANCER": "RELANCE POSSIBLE",
+                      "ABANDON_TP_ATTEINT": "GAIN MANQUE",
+                      "ABANDON_SL_DEPASSE": "PERTE EVITEE",
+                      "ABANDON_EXPIRE": "SIGNAL EXPIRE",
+                      "ABANDON": "SIGNAL ABANDONNE"}.get(statut, "SIGNAL SUIVI")
 
-                # Issue trouvee : on notifie, on journalise, on retire
-                age_min = round((time.time() - sig.get("cree_ts", 0)) / 60)
-                icone = {"RELANCER": "🔄", "ABANDON_TP_ATTEINT": "⚠️",
-                         "ABANDON_SL_DEPASSE": "✅", "ABANDON_EXPIRE": "⏰",
-                         "ABANDON": "❌"}.get(statut, "ℹ️")
-                txt = (f"{icone} SIGNAL SURVEILLE — {sig.get('pair')}\n"
-                       f"Bloque il y a {age_min} min (score {sig.get('score')})\n"
-                       f"{message}\n")
-                if statut == "RELANCER":
-                    txt += "\n👉 Relance une analyse sur cette paire."
-                elif statut == "ABANDON_SL_DEPASSE":
-                    txt += "\nLe systeme a eu RAISON de bloquer."
-                elif statut == "ABANDON_TP_ATTEINT":
-                    txt += "\nLe systeme a eu TORT de bloquer — gain manque."
-                try:
-                    send_tg(TELEGRAM_CHAT_ID, txt)
-                except Exception:
-                    pass
-                journaliser_surveillance(sig, statut, message)
-                a_retirer.append(tid)
+            # Texte simple : ni emoji ni caractere exotique (cause des messages vides)
+            lignes = []
+            lignes.append("SURVEILLANCE - " + entete)
+            lignes.append(str(sig.get("pair") or "?") + " | bloque il y a " + str(age_min) + " min")
+            lignes.append("Score " + str(sig.get("score") or "?") +
+                          " | consensus " + str(sig.get("consensus_long")) +
+                          "/" + str(sig.get("consensus_short")))
+            if message:
+                lignes.append(str(message))
+            if statut == "RELANCER":
+                lignes.append("-> Relance une analyse sur cette paire.")
+            elif statut == "ABANDON_SL_DEPASSE":
+                lignes.append("-> Le systeme a eu RAISON de bloquer.")
+            elif statut == "ABANDON_TP_ATTEINT":
+                lignes.append("-> Le systeme a eu TORT de bloquer.")
+            txt = "\n".join(lignes)
 
-            for tid in a_retirer:
-                SIGNAUX_SURVEILLES.pop(tid, None)
-            _sauver_surveillance()
+            try:
+                send_tg(TELEGRAM_CHAT_ID, txt)
+            except Exception as e:
+                print(f"Surveillance Telegram: {e}")
+
+            journaliser_surveillance(sig, statut, message)
+            sig["statut"] = statut
+            _ecrire_surveillance(tid, sig, statut)   # sort de EN_SURVEILLANCE
+            print(f"Surveillance #{tid} -> {statut}")
         except Exception as e:
-            print(f"Surveillance erreur: {e}")
+            print(f"Surveillance signal {tid}: {e}")
 
-threading.Thread(target=surveillance_job, daemon=True).start()
+@app.before_request
+def _hook_surveillance():
+    """Chaque requete au backend declenche une verification si le delai est ecoule."""
+    try:
+        if request.path not in ("/", "/debug"):
+            verifier_signaux_en_attente()
+    except Exception:
+        pass
+
+@app.route("/surveiller/verifier", methods=["GET"])
+def forcer_verification():
+    """Forcer une verification immediate (utile pour tester)."""
+    verifier_signaux_en_attente(force=True)
+    return jsonify({"ok": True, "restants": len(_lire_surveillance())})
 
 # ── SCHEDULER ─────────────────────────────────────────────────
 def scheduler_job():
