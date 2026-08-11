@@ -209,6 +209,23 @@ init_db()
 # Transforme chaque trade en enseignement exploitable, base sur les CAUSES
 # (TRAP, CISD, regime, pente RSI) et JAMAIS sur la paire. Une lecon du type
 # "EUR/USD perd, j'evite EUR/USD" serait une conclusion, pas une cause.
+def lire_montant(txt):
+    """Transforme '-590,60 EUR' ou '+176.50' en nombre. None si illisible.
+    v9 : le montant n'etait JAMAIS enregistre (colonne pnl vide sur tous les
+    trades). Sans lui, la memoire ne distingue pas une perte de 20 EUR d'une
+    perte de 590 EUR : elles pesent pareil."""
+    s = (txt or "").strip()
+    for c in ("\u20ac", "EUR", "eur", "euros", "euro", " ", "+"):
+        s = s.replace(c, "")
+    s = s.replace(",", ".")
+    try:
+        v = float(s)
+    except Exception:
+        return None
+    if v != v or abs(v) > 1000000:   # NaN ou montant aberrant
+        return None
+    return v
+
 def generer_lecon(t):
     res  = (t.get("resultat") or "").lower()
     trap = str(t.get("trap") or "").lower() in ("true","1","oui")
@@ -561,6 +578,53 @@ def telegram_webhook():
         chat_id_msg = message.get("chat", {}).get("id")
         text_msg = message.get("text", "").strip()
         if text_msg and chat_id_msg and str(chat_id_msg) == str(TELEGRAM_CHAT_ID):
+            # ── ETAPE MONTANT (v9) : on attend un NOMBRE ────────────
+            trade_montant = None
+            for tid, fb in list(pending_feedback.items()):
+                if fb.get("step") == "montant":
+                    trade_montant = tid
+                    break
+            if trade_montant:
+                val = lire_montant(text_msg)
+                if val is None:
+                    send_tg(chat_id_msg,
+                        "❌ Je n'ai pas compris ce nombre.\n"
+                        "Tape juste le montant, exemple : <code>-590.60</code>\n"
+                        "Ou appuie sur Passer dans le message précédent.")
+                    return jsonify({"ok": True})
+                try:
+                    conn = get_db(); c = conn.cursor()
+                    c.execute("UPDATE journal SET pnl=%s WHERE id=%s",
+                              (val, int(trade_montant)))
+                    conn.commit()
+                    # Reecrire la LECON en y ajoutant le montant. C'est la lecon
+                    # que les agents relisent avant chaque analyse — pas la
+                    # colonne pnl. Sans ca, le montant reste invisible pour eux.
+                    c.execute("SELECT lecon FROM journal WHERE id=%s", (int(trade_montant),))
+                    row = c.fetchone()
+                    if row and row.get("lecon") and "[Impact :" not in row["lecon"]:
+                        signe = "+" if val >= 0 else ""
+                        neuf = f"{row['lecon']} [Impact : {signe}{val} EUR]"
+                        c.execute("UPDATE journal SET lecon=%s WHERE id=%s",
+                                  (neuf, int(trade_montant)))
+                        conn.commit()
+                    conn.close()
+                    print(f"Montant trade #{trade_montant}: {val} EUR")
+                except Exception as e:
+                    print(f"Erreur montant: {e}")
+                fb = pending_feedback[trade_montant]
+                fb["step"] = "systeme"
+                pending_feedback[trade_montant] = fb
+                signe = "+" if val >= 0 else ""
+                send_tg(chat_id_msg,
+                    f"💰 <b>{signe}{val} €</b> enregistré.\n\n"
+                    f"<b>🦊 Système suivi ?</b>\nEntrée au signal, SL/TP du plan, zéro main ?",
+                    {"inline_keyboard": [[
+                        {"text": "✅ OUI — plan respecté", "callback_data": f"s_{trade_montant}_oui"},
+                        {"text": "❌ NON — hors système",  "callback_data": f"s_{trade_montant}_non"}
+                    ]]})
+                return jsonify({"ok": True})
+
             # Chercher si un trade attend un commentaire
             waiting_trade = None
             for tid, fb in list(pending_feedback.items()):
@@ -747,17 +811,18 @@ def telegram_webhook():
                 print(f"Erreur update journal: {e}")
             answer_callback(callback_id, "Presque fini !")
             edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
-            # Passer à l'étape commentaire
+            # v9 : nouvelle etape MONTANT avant "systeme suivi"
             fb["resultat"] = resultat
             fb["contexte"] = contexte
             fb["difficulte"] = difficulte
-            fb["step"] = "systeme"
+            fb["step"] = "montant"
             pending_feedback[trade_id] = fb
             send_tg(chat_id,
-                f"{label_d} noté.\n\n<b>🦊 Système suivi ?</b>\nEntrée au signal, SL/TP du plan, zéro main ?",
+                f"{label_d} noté.\n\n<b>💰 Montant du trade ?</b>\n"
+                f"Tape le résultat NET en euros.\n"
+                f"Exemple : <code>-590.60</code> ou <code>176.50</code>",
                 {"inline_keyboard": [[
-                    {"text": "✅ OUI — plan respecté", "callback_data": f"s_{trade_id}_oui"},
-                    {"text": "❌ NON — hors système",  "callback_data": f"s_{trade_id}_non"}
+                    {"text": "⏭️ Passer", "callback_data": f"skipmontant_{trade_id}"}
                 ]]})
 
     # ── SYSTEME SUIVI ? (discipline) ─────────────────────────
@@ -842,6 +907,21 @@ def telegram_webhook():
         pending_feedback[trade_id] = fb
 
     # ── SKIP COMMENTAIRE ─────────────────────────────────────
+    elif callback_data.startswith("skipmontant_"):
+        trade_id = callback_data.replace("skipmontant_", "")
+        fb = pending_feedback.get(trade_id, {})
+        fb["step"] = "systeme"
+        pending_feedback[trade_id] = fb
+        answer_callback(callback_id, "Montant ignoré")
+        edit_tg_markup(chat_id, message_id, {"inline_keyboard": []})
+        send_tg(chat_id,
+            "Montant non renseigné.\n\n<b>🦊 Système suivi ?</b>\n"
+            "Entrée au signal, SL/TP du plan, zéro main ?",
+            {"inline_keyboard": [[
+                {"text": "✅ OUI — plan respecté", "callback_data": f"s_{trade_id}_oui"},
+                {"text": "❌ NON — hors système",  "callback_data": f"s_{trade_id}_non"}
+            ]]})
+
     elif callback_data.startswith("skip_comment_"):
         trade_id = callback_data.replace("skip_comment_", "")
         fb = pending_feedback.get(trade_id, {})
@@ -858,22 +938,11 @@ def telegram_webhook():
 
     return jsonify({"ok": True})
 
-@app.route("/admin/reset-journal", methods=["GET"])
-def reset_journal():
-    secret = request.args.get("key","")
-    if secret != "RENARD2026":
-        return jsonify({"error": "Non autorise"}), 403
-    try:
-        conn = get_db()
-        c = conn.cursor()
-        # Garder uniquement les trades d'aujourd'hui (19/06/2026)
-        c.execute("DELETE FROM journal WHERE created_at NOT LIKE '2026-06-19%'")
-        deleted = c.rowcount
-        conn.commit()
-        conn.close()
-        return jsonify({"success": True, "message": f"{deleted} anciens trades supprimes. Trades du 19/06 conserves."})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+# ── ROUTE SUPPRIMEE le 11/08/2026 : /admin/reset-journal ─────
+# Elle effacait TOUS les trades sauf ceux du 19/06/2026, protegee par une
+# cle ecrite en clair dans ce fichier — lui-meme public sur GitHub.
+# N'importe qui pouvait vider le journal avec une simple adresse web.
+# Ne pas la remettre. Pour effacer des trades, passer par la base.
 
 def setup_webhook():
     webhook_url = "https://trading-master-backend.onrender.com/webhook/telegram"
