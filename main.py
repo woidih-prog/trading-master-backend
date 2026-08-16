@@ -37,6 +37,24 @@ ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_KEY")
 REDIS_URL        = os.environ.get("REDIS_URL", "redis://red-d8j855mq1p3s73ff62ig:6379")
 DATABASE_URL     = os.environ.get("DATABASE_URL")
 
+# ══════════════════════════════════════════════════════════════
+# PHASE 1 MULTI-UTILISATEURS (16/08/2026) — L'ETIQUETTE DE PROPRIETAIRE
+#
+# Jusqu'ici RENARD ne savait pas QUI. Il n'y avait pas "ton journal",
+# il y avait "LE journal" : une seule table commune, sans proprietaire.
+# Aucun ecran ne pouvait afficher "mes trades" plutot que "les trades".
+#
+# Cette phase pose UNE colonne compte_id sur les trois tables, et
+# attribue toutes les lignes existantes au proprietaire.
+#
+# TOUT EST ADDITIF. Si compte_id est absent d'une requete, le
+# comportement est EXACTEMENT celui d'avant. Aucune regle de trading
+# touchee, aucun changement dans ce que lisent les 8 agents.
+# ══════════════════════════════════════════════════════════════
+COMPTE_PROPRIETAIRE = os.environ.get("COMPTE_PROPRIETAIRE", "22631676")
+PROPRIETAIRE_PRENOM = os.environ.get("PROPRIETAIRE_PRENOM", "Woidih")
+PROPRIETAIRE_NOM    = os.environ.get("PROPRIETAIRE_NOM", "TARKHANI")
+
 PARIS_TZ = pytz.timezone('Europe/Paris')
 
 # Les cryptos vivent 24/7 (source Binance) — tout le reste suit les horaires forex
@@ -166,6 +184,89 @@ def enrich(data, symbol):
 def get_db():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
+def init_identite():
+    """Cree les tables d'identite, inscrit le proprietaire, pose la colonne
+    compte_id sur les trois tables et attribue l'existant.
+    Tourne a chaque demarrage : tout est idempotent (IF NOT EXISTS,
+    ON CONFLICT DO NOTHING, WHERE compte_id IS NULL)."""
+    try:
+        conn = get_db(); c = conn.cursor()
+
+        # -- Les personnes ------------------------------------------
+        c.execute("""CREATE TABLE IF NOT EXISTS utilisateurs (
+            id               SERIAL PRIMARY KEY,
+            email            TEXT UNIQUE,
+            mot_de_passe     TEXT,
+            prenom           TEXT,
+            nom              TEXT,
+            role             TEXT DEFAULT 'client',
+            telegram_chat_id TEXT,
+            actif            BOOLEAN DEFAULT true,
+            cree_le          TIMESTAMP DEFAULT NOW()
+        )""")
+        conn.commit()
+
+        # -- Les comptes de trading ---------------------------------
+        c.execute("""CREATE TABLE IF NOT EXISTS comptes (
+            compte_id        TEXT PRIMARY KEY,
+            utilisateur_id   INTEGER REFERENCES utilisateurs(id),
+            courtier         TEXT,
+            type             TEXT,
+            devise           TEXT DEFAULT 'EUR',
+            balance_initiale REAL,
+            actif            BOOLEAN DEFAULT true,
+            note             TEXT,
+            cree_le          TIMESTAMP DEFAULT NOW()
+        )""")
+        conn.commit()
+
+        # -- Le proprietaire ----------------------------------------
+        # mot_de_passe reste NULL : aucune authentification en phase 1.
+        # Elle viendra en phase 3, avec un hachage (bcrypt/argon2).
+        c.execute("""INSERT INTO utilisateurs (id, prenom, nom, role, telegram_chat_id)
+                     VALUES (1, %s, %s, 'proprietaire', %s)
+                     ON CONFLICT (id) DO UPDATE
+                     SET prenom = EXCLUDED.prenom,
+                         nom    = EXCLUDED.nom,
+                         role   = 'proprietaire'""",
+                  (PROPRIETAIRE_PRENOM, PROPRIETAIRE_NOM, TELEGRAM_CHAT_ID))
+        conn.commit()
+
+        c.execute("""INSERT INTO comptes
+                     (compte_id, utilisateur_id, courtier, type, devise, balance_initiale, note)
+                     VALUES (%s, 1, 'Admirals Group AS', 'DEMO', 'EUR', 92000,
+                             'Compte du Carnet C - VPS Londres')
+                     ON CONFLICT (compte_id) DO NOTHING""",
+                  (COMPTE_PROPRIETAIRE,))
+        conn.commit()
+
+        # -- La colonne, sur les trois tables -----------------------
+        # Un commit par table : sur PostgreSQL, une seule instruction en
+        # erreur met TOUTE la transaction en echec (meme piege que les
+        # colonnes du journal, corrige plus haut).
+        for table in ("journal", "surveillance", "trade_peaks"):
+            try:
+                c.execute("ALTER TABLE %s ADD COLUMN IF NOT EXISTS compte_id TEXT" % table)
+                conn.commit()
+                c.execute("UPDATE %s SET compte_id = %%s WHERE compte_id IS NULL" % table,
+                          (COMPTE_PROPRIETAIRE,))
+                touchees = c.rowcount
+                conn.commit()
+                c.execute("CREATE INDEX IF NOT EXISTS idx_%s_compte ON %s (compte_id)" % (table, table))
+                conn.commit()
+                if touchees:
+                    print("Identite : %d ligne(s) de %s attribuees a %s"
+                          % (touchees, table, COMPTE_PROPRIETAIRE))
+            except Exception as e:
+                conn.rollback()
+                print("Identite table %s : %s" % (table, e))
+
+        conn.close()
+        print("Identite OK — proprietaire %s %s, compte %s"
+              % (PROPRIETAIRE_PRENOM, PROPRIETAIRE_NOM, COMPTE_PROPRIETAIRE))
+    except Exception as e:
+        print("Identite erreur: %s" % e)
+
 def init_db():
     try:
         conn = get_db()
@@ -204,6 +305,7 @@ def init_db():
         print(f"PostgreSQL erreur: {e}")
 
 init_db()
+init_identite()   # phase 1 multi-utilisateurs
 
 # ── GENERATEUR DE LECON (v7) ──────────────────────────────────
 # Transforme chaque trade en enseignement exploitable, base sur les CAUSES
@@ -336,28 +438,152 @@ def market_status():
         "notice": None if opened else "Marche forex FERME — seules les cryptos sont analysables. Reouverture dimanche 23h Paris."
     })
 
-# ── SOMMET DES TRADES (mesure trailing, v6) ───────────────────
-# Le robot envoie, pour chaque trade ferme, le profit MAX atteint (en R) et le
-# resultat final. On accumule ces donnees pour decider du reglage du trailing.
-TRADE_PEAKS = []  # en memoire ; persiste aussi dans un fichier simple
+# ══════════════════════════════════════════════════════════════
+# SOMMET DES TRADES (mesure trailing) — v9 REPARE le 12/08/2026
+#
+# CE QUI ETAIT CASSE :
+#   1. DOUBLONS. L'EA envoie plusieurs fois le meme ticket (retry, boucle de
+#      fermeture). Chaque envoi etait AJOUTE a la liste. Resultat constate :
+#      20 lignes pour 5 trades reels.
+#   2. ECRASEMENT PAR DES ZEROS. Le dernier envoi arrive souvent avec
+#      peak_r = 0 (position deja fermee, plus rien a mesurer). Ces zeros
+#      etaient comptes comme de vrais sommets.
+#   3. SYNTHESE FAUSSEE. Consequence des deux precedents : le 12/08 la
+#      synthese annoncait "15% ont atteint 1R / 15% ont atteint 1.5R /
+#      15% ont atteint 2R" — trois fois le meme chiffre, parce que c'etait
+#      simplement 3 doublons d'un seul trade sur 20 lignes. Le sommet moyen
+#      affiche (0.71R) etait ecrase par les zeros. Toute la synthese etait
+#      inutilisable, et c'est precisement la mesure qui doit servir a regler
+#      le trailing.
+#   4. STOCKAGE DANS /tmp. Efface a chaque redeploiement Render. Meme erreur
+#      que la surveillance avant sa correction du 10/08.
+#
+# CE QUI CHANGE :
+#   - UN SEUL enregistrement par ticket (cle primaire en base).
+#   - Le sommet conserve est le MAXIMUM jamais recu : un envoi a 0 ne peut
+#     plus effacer un sommet a 2.93.
+#   - Stockage en PostgreSQL, avec repli sur la memoire vive si la base
+#     est indisponible.
+#   - La synthese compare le sommet des GAGNANTS et celui des PERDANTS :
+#     c'est cette comparaison qui dira si le trailing coupe trop tot.
+#
+# AVERTISSEMENT SUR L'UNITE : l'EA calcule le R sur la distance REELLE du
+# stop au moment de l'ouverture, pas sur le risque prevu par le signal.
+# Quand l'entree reelle differe de l'entree planifiee, les deux ne sont pas
+# la meme chose. Ne pas melanger ces R avec ceux calcules a la main depuis
+# les euros. A trancher plus tard.
+# ══════════════════════════════════════════════════════════════
+TRADE_PEAKS = {}   # repli memoire : { ticket -> enregistrement }
 
-def _load_peaks():
-    global TRADE_PEAKS
+def _init_table_peaks():
     try:
-        if os.path.exists("/tmp/trade_peaks.json"):
-            with open("/tmp/trade_peaks.json") as f:
-                TRADE_PEAKS = json.load(f)
-    except Exception:
-        TRADE_PEAKS = []
+        conn = get_db(); c = conn.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS trade_peaks (
+            ticket TEXT PRIMARY KEY,
+            symbol TEXT,
+            peak_r DOUBLE PRECISION,
+            profit_final DOUBLE PRECISION,
+            nb_envois INTEGER DEFAULT 1,
+            premier_ts TEXT,
+            dernier_ts TEXT
+        )""")
+        conn.commit(); conn.close()
+        print("Table trade_peaks OK")
+        return True
+    except Exception as e:
+        print(f"Table trade_peaks erreur: {e}")
+        return False
 
-def _save_peaks():
+_init_table_peaks()
+
+def _migrer_anciens_peaks():
+    """Recupere l'ancien fichier /tmp en dedoublonnant : un ticket = son
+    sommet MAXIMUM. Ne tourne qu'une fois, les doublons ne peuvent pas
+    reapparaitre grace a la cle primaire."""
     try:
-        with open("/tmp/trade_peaks.json", "w") as f:
-            json.dump(TRADE_PEAKS[-500:], f)  # garder les 500 derniers
-    except Exception:
-        pass
+        if not os.path.exists("/tmp/trade_peaks.json"):
+            return
+        with open("/tmp/trade_peaks.json") as f:
+            anciens = json.load(f)
+        if not isinstance(anciens, list) or not anciens:
+            return
+        meilleurs = {}
+        for a in anciens:
+            t = str(a.get("ticket") or "")
+            if not t:
+                continue
+            try:    pr = float(a.get("peak_r") or 0)
+            except Exception: pr = 0.0
+            if t not in meilleurs or pr > meilleurs[t]["peak_r"]:
+                meilleurs[t] = {"ticket": t, "symbol": a.get("symbol", ""),
+                                "peak_r": pr, "profit_final": a.get("profit_final", 0),
+                                "ts": a.get("ts", "")}
+            elif a.get("profit_final"):
+                meilleurs[t]["profit_final"] = a.get("profit_final")
+        for t, m in meilleurs.items():
+            _ecrire_peak(m["ticket"], m["symbol"], m["peak_r"], m["profit_final"], m["ts"])
+        print(f"Migration sommets : {len(anciens)} lignes -> {len(meilleurs)} trades")
+        try:    os.rename("/tmp/trade_peaks.json", "/tmp/trade_peaks.json.migre")
+        except Exception: pass
+    except Exception as e:
+        print(f"Migration sommets erreur: {e}")
 
-_load_peaks()
+def _ecrire_peak(ticket, symbol, peak_r, profit_final, ts):
+    """Ecrit ou met a jour UN ticket. Le sommet conserve est le maximum
+    jamais recu — un envoi tardif a 0 ne peut plus rien effacer."""
+    ticket = str(ticket)
+    try:
+        conn = get_db(); c = conn.cursor()
+        c.execute("""INSERT INTO trade_peaks
+                     (ticket, symbol, peak_r, profit_final, nb_envois, premier_ts, dernier_ts)
+                     VALUES (%s,%s,%s,%s,1,%s,%s)
+                     ON CONFLICT (ticket) DO UPDATE SET
+                       symbol       = COALESCE(NULLIF(EXCLUDED.symbol,''), trade_peaks.symbol),
+                       peak_r       = GREATEST(trade_peaks.peak_r, EXCLUDED.peak_r),
+                       profit_final = CASE WHEN EXCLUDED.profit_final <> 0
+                                           THEN EXCLUDED.profit_final
+                                           ELSE trade_peaks.profit_final END,
+                       nb_envois    = trade_peaks.nb_envois + 1,
+                       dernier_ts   = EXCLUDED.dernier_ts""",
+                  (ticket, symbol or "", float(peak_r or 0),
+                   float(profit_final or 0), ts, ts))
+        conn.commit(); conn.close()
+        return True
+    except Exception as e:
+        print(f"Ecriture sommet erreur: {e}")
+        # Repli memoire, avec la meme regle du maximum
+        ex = TRADE_PEAKS.get(ticket)
+        pr = float(peak_r or 0)
+        if ex is None:
+            TRADE_PEAKS[ticket] = {"ticket": ticket, "symbol": symbol or "",
+                                   "peak_r": pr, "profit_final": profit_final or 0,
+                                   "nb_envois": 1, "premier_ts": ts, "dernier_ts": ts}
+        else:
+            ex["peak_r"] = max(ex.get("peak_r", 0), pr)
+            if profit_final:
+                ex["profit_final"] = profit_final
+            if symbol:
+                ex["symbol"] = symbol
+            ex["nb_envois"] = ex.get("nb_envois", 1) + 1
+            ex["dernier_ts"] = ts
+        return False
+
+def _lire_peaks():
+    """Renvoie la liste des trades, un par ticket, sommet decroissant."""
+    try:
+        conn = get_db(); c = conn.cursor()
+        c.execute("""SELECT ticket, symbol, peak_r, profit_final, nb_envois,
+                            premier_ts, dernier_ts
+                     FROM trade_peaks ORDER BY dernier_ts DESC LIMIT 300""")
+        rows = [dict(r) for r in c.fetchall()]
+        conn.close()
+        if rows:
+            return rows
+    except Exception as e:
+        print(f"Lecture sommets erreur: {e}")
+    return list(TRADE_PEAKS.values())
+
+_migrer_anciens_peaks()
 
 @app.route("/trade-peak", methods=["POST"])
 def trade_peak():
@@ -365,35 +591,53 @@ def trade_peak():
         d = request.get_json(force=True) or {}
     except Exception:
         return jsonify({"error": "json invalide"}), 400
-    entry = {
-        "ticket": d.get("ticket"),
-        "symbol": d.get("symbol", ""),
-        "peak_r": d.get("peak_r", 0),
-        "profit_final": d.get("profit_final", 0),
-        "ts": datetime.now(timezone.utc).isoformat()
-    }
-    TRADE_PEAKS.append(entry)
-    _save_peaks()
-    return jsonify({"ok": True, "recorded": entry})
+    ticket = d.get("ticket")
+    if not ticket:
+        return jsonify({"error": "ticket requis"}), 400
+    ts = datetime.now(timezone.utc).isoformat()
+    en_base = _ecrire_peak(ticket, d.get("symbol", ""),
+                           d.get("peak_r", 0), d.get("profit_final", 0), ts)
+    return jsonify({"ok": True, "ticket": str(ticket),
+                    "stockage": "base" if en_base else "memoire (base indisponible)"})
 
 @app.route("/trade-peaks", methods=["GET"])
 def trade_peaks_list():
-    """Renvoie les donnees de sommet + une petite synthese pour decider du trailing."""
-    peaks = [p for p in TRADE_PEAKS if p.get("peak_r") is not None]
-    n = len(peaks)
+    """Mesure du trailing : jusqu'ou le trade est alle, ou il s'est arrete.
+    Un trade = une ligne. Les doublons et les zeros ne comptent plus."""
+    trades = [t for t in _lire_peaks() if t.get("peak_r") is not None]
+    n = len(trades)
     synthese = {}
     if n > 0:
-        pr = [float(p["peak_r"]) for p in peaks]
-        # combien de trades ont atteint au moins 1R, 1.5R, 2R
+        pr = sorted(float(t["peak_r"]) for t in trades)
+        gagnants = [float(t["peak_r"]) for t in trades if float(t.get("profit_final") or 0) > 0]
+        perdants = [float(t["peak_r"]) for t in trades if float(t.get("profit_final") or 0) < 0]
+        def pct(seuil):
+            return round(100 * sum(1 for x in pr if x >= seuil) / n)
+        def moy(lst):
+            return round(sum(lst) / len(lst), 2) if lst else None
+        milieu = pr[n // 2] if n % 2 else (pr[n // 2 - 1] + pr[n // 2]) / 2
         synthese = {
             "nb_trades": n,
-            "sommet_moyen_R": round(sum(pr) / n, 2),
-            "ont_atteint_1R_pct": round(100 * sum(1 for x in pr if x >= 1.0) / n),
-            "ont_atteint_1_5R_pct": round(100 * sum(1 for x in pr if x >= 1.5) / n),
-            "ont_atteint_2R_pct": round(100 * sum(1 for x in pr if x >= 2.0) / n),
-            "ont_atteint_3R_pct": round(100 * sum(1 for x in pr if x >= 3.0) / n),
+            "sommet_moyen_R": moy(pr),
+            "sommet_median_R": round(milieu, 2),
+            "sommet_max_R": round(pr[-1], 2),
+            "ont_atteint_1R_pct": pct(1.0),
+            "ont_atteint_1_5R_pct": pct(1.5),
+            "ont_atteint_2R_pct": pct(2.0),
+            "ont_atteint_3R_pct": pct(3.0),
+            "nb_gagnants": len(gagnants),
+            "nb_perdants": len(perdants),
+            "sommet_moyen_gagnants_R": moy(gagnants),
+            "sommet_moyen_perdants_R": moy(perdants),
+            "lecture": ("Si le sommet moyen des PERDANTS est eleve (>0.7R), le trailing "
+                        "ou le BE laissent filer des trades qui avaient commence a "
+                        "fonctionner. Si le sommet moyen des GAGNANTS est tres au-dessus "
+                        "du gain encaisse, le trailing coupe trop tot."),
+            "avertissement_unite": ("R calcule par l'EA sur la distance REELLE du stop a "
+                                    "l'ouverture. Ne pas melanger avec un R recalcule "
+                                    "depuis les euros et le risque prevu.")
         }
-    return jsonify({"synthese": synthese, "trades": peaks[-100:]})
+    return jsonify({"synthese": synthese, "nb_trades": n, "trades": trades})
 
 # ── TAILLE DE LOT (securite v4) ───────────────────────────────
 # Le systeme affichait "Risque 1%" mais laissait le trader mettre 1 lot fixe.
@@ -1082,6 +1326,14 @@ def add_trade():
              str(data.get("trap")), str(data.get("cisd")), str(data.get("msu")),
              str(data.get("consensus_long")), str(data.get("consensus_short")),
              str(data.get("gate_blocked"))))
+        # Phase 1 : etiquette de proprietaire. Si la page ne l'envoie pas
+        # (c'est le cas aujourd'hui), on met le compte du proprietaire.
+        # Rien a modifier dans index.html ni dans l'EA.
+        try:
+            c.execute("UPDATE journal SET compte_id=%s WHERE id=(SELECT MAX(id) FROM journal)",
+                      (data.get("compte_id") or COMPTE_PROPRIETAIRE,))
+        except Exception as e:
+            print(f"compte_id add_trade: {e}")
         conn.commit()
         trade_id = c.fetchone()["id"]
         conn.close()
@@ -1095,7 +1347,13 @@ def get_trades():
     try:
         conn = get_db()
         c = conn.cursor()
-        c.execute("SELECT * FROM journal ORDER BY id DESC LIMIT 100")
+        # Filtre OPTIONNEL par compte. Sans le parametre, comportement
+        # strictement identique a avant.
+        cid = request.args.get("compte_id")
+        if cid:
+            c.execute("SELECT * FROM journal WHERE compte_id=%s ORDER BY id DESC LIMIT 100", (cid,))
+        else:
+            c.execute("SELECT * FROM journal ORDER BY id DESC LIMIT 100")
         rows = c.fetchall()
         conn.close()
         return jsonify([dict(r) for r in rows])
@@ -1377,6 +1635,32 @@ def get_journal_context():
         print(f"Erreur journal/context: {e}")
         return jsonify({"context": "", "has_data": False})
 
+@app.route("/identite", methods=["GET"])
+def identite():
+    """Qui est qui. Lecture seule, sert a verifier la phase 1."""
+    try:
+        conn = get_db(); c = conn.cursor()
+        c.execute("SELECT id, prenom, nom, role, telegram_chat_id, actif, cree_le "
+                  "FROM utilisateurs ORDER BY id")
+        users = [dict(r) for r in c.fetchall()]
+        c.execute("SELECT compte_id, utilisateur_id, courtier, type, devise, "
+                  "balance_initiale, actif, note FROM comptes ORDER BY compte_id")
+        cpts = [dict(r) for r in c.fetchall()]
+        repartition = {}
+        for t in ("journal", "surveillance", "trade_peaks"):
+            try:
+                c.execute("SELECT COALESCE(compte_id,'(sans etiquette)') AS cid, COUNT(*) AS n "
+                          "FROM %s GROUP BY 1 ORDER BY 2 DESC" % t)
+                repartition[t] = {r["cid"]: r["n"] for r in c.fetchall()}
+            except Exception as e:
+                repartition[t] = {"erreur": str(e)}
+        conn.close()
+        return jsonify({"utilisateurs": users, "comptes": cpts,
+                        "repartition_des_lignes": repartition,
+                        "compte_par_defaut": COMPTE_PROPRIETAIRE})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/lecons", methods=["GET"])
 def lecons():
     """Bibliotheque des enseignements. Filtres: ?resultat=loss"""
@@ -1389,6 +1673,8 @@ def lecons():
             sql += "AND resultat = %s "; params.append(request.args.get("resultat"))
         if request.args.get("pair"):
             sql += "AND pair = %s "; params.append(request.args.get("pair"))
+        if request.args.get("compte_id"):
+            sql += "AND compte_id = %s "; params.append(request.args.get("compte_id"))
         sql += "ORDER BY id DESC LIMIT 100"
         c.execute(sql, tuple(params))
         rows = [dict(r) for r in c.fetchall()]
