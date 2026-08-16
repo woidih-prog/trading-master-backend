@@ -289,7 +289,11 @@ def init_db():
         # rollback en cas d'echec pour repartir sur une transaction propre.
         # v7 MEMOIRE : rapports_agents conserve le RAISONNEMENT des 8 agents
         # + orchestrateur. Sans lui, chaque analyse repartait de zero.
-        for col in ['direction_ok','entree_ok','sortie_ok','raison_sortie','systeme_suivi',
+        # 16/08 : rr_reel_feu et voie. Le RR reel etait calcule, affiche
+        # dans Telegram... et perdu. La voie (avec ou sans Enqueteur) n'etait
+        # nulle part. Ce sont les DEUX questions les plus utiles a compter.
+        for col in ['rr_reel_feu','rr_reel_valeur','rr_reel_mur','voie',
+                    'direction_ok','entree_ok','sortie_ok','raison_sortie','systeme_suivi',
                     'rapports_agents','market_state','regime_ratio','rsi_value','rsi_pente',
                     'trap','cisd','msu','consensus_long','consensus_short','gate_blocked','lecon']:
             try:
@@ -1312,9 +1316,10 @@ def add_trade():
              resultat,contexte_marche,difficulte,pnl,commentaire,created_at,
              direction_ok,entree_ok,sortie_ok,raison_sortie,
              rapports_agents,market_state,regime_ratio,rsi_value,rsi_pente,
-             trap,cisd,msu,consensus_long,consensus_short,gate_blocked)
+             trap,cisd,msu,consensus_long,consensus_short,gate_blocked,
+             rr_reel_feu,rr_reel_valeur,rr_reel_mur,voie)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING id''',
             (data.get("date"),data.get("pair"),data.get("tf"),data.get("session"),
              data.get("score"),data.get("decision"),data.get("bias"),
@@ -1330,7 +1335,9 @@ def add_trade():
              str(data.get("rsi_pente")) if data.get("rsi_pente") is not None else None,
              str(data.get("trap")), str(data.get("cisd")), str(data.get("msu")),
              str(data.get("consensus_long")), str(data.get("consensus_short")),
-             str(data.get("gate_blocked"))))
+             str(data.get("gate_blocked")),
+             data.get("rr_reel_feu"), data.get("rr_reel_valeur"),
+             data.get("rr_reel_mur"), data.get("voie")))
         # Phase 1 : etiquette de proprietaire. Si la page ne l'envoie pas
         # (c'est le cas aujourd'hui), on met le compte du proprietaire.
         # Rien a modifier dans index.html ni dans l'EA.
@@ -1639,6 +1646,172 @@ def get_journal_context():
     except Exception as e:
         print(f"Erreur journal/context: {e}")
         return jsonify({"context": "", "has_data": False})
+
+# ══════════════════════════════════════════════════════════════
+# COMPTEURS AUTOMATIQUES (16/08/2026) — LECTURE SEULE
+#
+# Compter a la main est la meilleure methode : elle oblige a regarder
+# chaque trade. C'est comme ca qu'ont ete trouves le stop de l'or et
+# le TP place au-dela du mur. Mais elle demande une discipline que
+# personne ne tient sur 100 trades.
+#
+# Cette route compte a la place. Elle ne DECIDE rien, ne modifie rien,
+# n'ecrit rien. Elle lit le journal et pose, pour chaque question,
+# quatre nombres : gains, pertes, taux, montant.
+#
+# Et surtout elle applique les deux garde-fous qu'un tableau ordinaire
+# n'applique jamais :
+#   1) FRAGILITE : de combien de points le taux bougerait-il si on
+#      retirait UN SEUL trade ? Si un trade change la conclusion,
+#      il n'y a pas de conclusion.
+#   2) EFFECTIF : en dessous de 10 trades dans une case, on ne conclut
+#      pas. En dessous de 20, on reste prudent.
+#
+# Le verdict ne dit JAMAIS "prouve". Au mieux "piste a surveiller".
+# ══════════════════════════════════════════════════════════════
+
+def _vrai(v):
+    return str(v or "").strip().lower() in ("true", "1", "oui", "yes")
+
+def _boite(lignes):
+    """Un paquet de trades -> gains, pertes, taux, montant, fragilite."""
+    g = sum(1 for t in lignes if (t.get("resultat") or "") == "win")
+    p = sum(1 for t in lignes if (t.get("resultat") or "") == "loss")
+    b = sum(1 for t in lignes if (t.get("resultat") or "") == "be")
+    n = g + p + b
+    if n == 0:
+        return {"n": 0, "gains": 0, "pertes": 0, "be": 0, "taux": None,
+                "pnl": None, "fragilite_points": None}
+    taux = 100.0 * g / n
+    # Fragilite : le pire des deux cas, retirer un gain ou retirer une perte
+    frag = 0.0
+    if n > 1:
+        if g > 0: frag = max(frag, abs(taux - 100.0 * (g - 1) / (n - 1)))
+        if p > 0: frag = max(frag, abs(taux - 100.0 * g / (n - 1)))
+    montants = [float(t["pnl"]) for t in lignes if t.get("pnl") is not None]
+    return {
+        "n": n, "gains": g, "pertes": p, "be": b,
+        "taux": round(taux),
+        "pnl": round(sum(montants), 2) if montants else None,
+        "pnl_connu_sur": len(montants),
+        "fragilite_points": round(frag)
+    }
+
+def _verdict(a, b):
+    """Que peut-on dire honnetement de la comparaison de deux boites ?"""
+    if a["n"] == 0 or b["n"] == 0:
+        return {"verdict": "RIEN A DIRE", "raison": "une des deux cases est vide"}
+    petit = min(a["n"], b["n"])
+    if petit < 10:
+        return {"verdict": "DONNEE INSUFFISANTE",
+                "raison": "seulement %d trade(s) dans la plus petite case, il en faut 20" % petit}
+    ecart = abs(a["taux"] - b["taux"])
+    frag = max(a["fragilite_points"] or 0, b["fragilite_points"] or 0)
+    if frag >= ecart:
+        return {"verdict": "TROP FRAGILE",
+                "raison": "un seul trade deplacerait le taux de %d points, "
+                          "pour un ecart mesure de %d points" % (frag, ecart)}
+    if ecart < 10:
+        return {"verdict": "AUCUNE DIFFERENCE",
+                "raison": "%d points d'ecart, c'est du bruit" % ecart}
+    if petit < 20:
+        return {"verdict": "PISTE FAIBLE",
+                "raison": "%d points d'ecart, mais seulement %d trades dans la plus petite case"
+                          % (ecart, petit)}
+    return {"verdict": "PISTE A SURVEILLER",
+            "raison": "%d points d'ecart sur %d trades minimum. Continuer a compter, "
+                      "ne rien coder avant 50." % (ecart, petit)}
+
+@app.route("/compteurs", methods=["GET"])
+def compteurs():
+    """Compte tout seul ce qu'il faudrait compter a la main.
+    Lecture seule. Filtre optionnel : ?compte_id=XXX"""
+    try:
+        conn = get_db(); c = conn.cursor()
+        sql = ("SELECT resultat, pnl, trap, cisd, msu, market_state, contexte_marche, "
+               "consensus_long, consensus_short, session, difficulte, systeme_suivi, "
+               "score, rsi_value, rsi_pente, bias, rr_reel_feu, voie "
+               "FROM journal WHERE resultat IN ('win','loss','be')")
+        params = []
+        if request.args.get("compte_id"):
+            sql += " AND compte_id = %s"; params.append(request.args.get("compte_id"))
+        try:
+            c.execute(sql, tuple(params))
+        except Exception:
+            # rr_reel_feu / voie pas encore posees : on relit sans elles
+            conn.rollback()
+            sql = sql.replace(", rr_reel_feu, voie", "")
+            c.execute(sql, tuple(params))
+        trades = [dict(r) for r in c.fetchall()]
+        conn.close()
+
+        total = len(trades)
+        if total == 0:
+            return jsonify({"trades_pris": 0, "message": "aucun trade pris a compter"})
+
+        def couper(test):
+            oui = [t for t in trades if test(t)]
+            non = [t for t in trades if not test(t)]
+            A, B = _boite(oui), _boite(non)
+            return {"avec": A, "sans": B, **_verdict(A, B)}
+
+        def ecart_cons(t):
+            try:    return abs(int(t.get("consensus_long") or 0) - int(t.get("consensus_short") or 0))
+            except Exception: return 0
+
+        questions = {
+            "TRAP_confirme":        couper(lambda t: _vrai(t.get("trap"))),
+            "CISD_confirme":        couper(lambda t: _vrai(t.get("cisd"))),
+            "MSU_detecte":          couper(lambda t: _vrai(t.get("msu"))),
+            "consensus_FORT_6plus": couper(lambda t: ecart_cons(t) >= 6),
+            "marche_RANGE":         couper(lambda t: (t.get("contexte_marche") or "").lower() == "range"),
+            "marche_MANIPULATION":  couper(lambda t: (t.get("contexte_marche") or "").lower() == "manipulation"),
+            "systeme_suivi_OUI":    couper(lambda t: (t.get("systeme_suivi") or "") == "oui"),
+            "score_70_ou_plus":     couper(lambda t: (t.get("score") or 0) >= 70),
+        }
+
+        # Questions qui ne repondent que si les champs existent
+        if any("rr_reel_feu" in t for t in trades):
+            def feu(t): return (t.get("rr_reel_feu") or "").upper()
+            questions["RR_reel_VERT"]  = couper(lambda t: feu(t) == "VERT")
+            questions["RR_reel_ROUGE"] = couper(lambda t: feu(t) == "ROUGE")
+        else:
+            questions["RR_reel"] = {"verdict": "NON ENREGISTRE",
+                "raison": "le RR reel est calcule et affiche, mais la page ne l'envoie pas au journal"}
+        if any("voie" in t for t in trades):
+            questions["via_ENQUETEUR"] = couper(lambda t: (t.get("voie") or "").upper().startswith("AVEC"))
+        else:
+            questions["voie_Enqueteur"] = {"verdict": "NON ENREGISTRE",
+                "raison": "avec ou sans Enqueteur n'est pas enregistre dans le journal"}
+
+        # Par difficulte et par session : simple repartition, pas de comparaison
+        def grouper(champ):
+            out = {}
+            for t in trades:
+                k = (t.get(champ) or "(non renseigne)")
+                out.setdefault(k, []).append(t)
+            return {k: _boite(v) for k, v in sorted(out.items())}
+
+        global_ = _boite(trades)
+        return jsonify({
+            "compte_id": request.args.get("compte_id") or "tous",
+            "trades_pris": total,
+            "global": global_,
+            "questions": questions,
+            "par_difficulte": grouper("difficulte"),
+            "par_session": grouper("session"),
+            "par_regime": grouper("market_state"),
+            "mode_d_emploi": {
+                "1": "Chaque question coupe les trades en deux cases et compare les taux.",
+                "2": "fragilite_points = de combien le taux bougerait si on retirait UN trade. "
+                     "Si ce nombre depasse l'ecart mesure, la comparaison ne vaut rien.",
+                "3": "Le verdict ne dit jamais PROUVE. Au mieux PISTE A SURVEILLER.",
+                "4": "Il faut 20 trades minimum dans la plus petite case, 50 pour coder une regle."
+            }
+        })
+    except Exception as e:
+        print(f"compteurs: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/identite", methods=["GET"])
 def identite():
