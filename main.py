@@ -305,7 +305,12 @@ def init_db():
         print(f"PostgreSQL erreur: {e}")
 
 init_db()
-init_identite()   # phase 1 multi-utilisateurs
+# NOTE : init_identite() n'est PAS appelee ici. Elle doit tourner APRES
+# la creation de TOUTES les tables. Au premier demarrage de cette version,
+# la table trade_peaks n'existe pas encore a cet endroit du fichier
+# (_init_table_peaks() est plus bas) : l'ALTER TABLE echouait en silence
+# et la colonne compte_id n'etait jamais posee. L'appel est deplace tout
+# en bas du fichier, apres _init_table_surveillance().
 
 # ── GENERATEUR DE LECON (v7) ──────────────────────────────────
 # Transforme chaque trade en enseignement exploitable, base sur les CAUSES
@@ -1739,6 +1744,12 @@ def _init_table_surveillance():
         print(f"Table surveillance erreur: {e}")
 
 _init_table_surveillance()
+
+# ── PHASE 1 MULTI-UTILISATEURS : APPEL FINAL ──────────────────
+# Placee ici, et nulle part ailleurs : toutes les tables (journal,
+# surveillance, trade_peaks) existent a ce stade. La migration peut
+# donc poser la colonne compte_id sur les trois sans en manquer une.
+init_identite()
 
 def _lire_surveillance():
     """Renvoie les signaux encore EN_SURVEILLANCE, depuis la base."""
