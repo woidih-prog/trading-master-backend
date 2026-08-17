@@ -1351,8 +1351,40 @@ def add_trade():
         conn.close()
         return jsonify({"success": True, "id": trade_id})
     except Exception as e:
-        print(f"Erreur add_trade: {e}")
-        return jsonify({"error": str(e)}), 500
+        # ── FILET DE SECURITE (17/08/2026) ────────────────────────
+        # INCIDENT REEL : la page a ete deployee avec 4 champs de plus
+        # (rr_reel_feu, rr_reel_valeur, rr_reel_mur, voie) avant le backend.
+        # L'insertion echouait, aucun id n'etait renvoye, et sans id le
+        # backend ne peut pas attacher les boutons Telegram : les signaux
+        # ATTENDRE arrivaient NUS, sans "Je prends / Je passe".
+        # Un champ inconnu ne doit JAMAIS faire perdre le trade entier.
+        # On reessaie donc avec les colonnes historiques uniquement.
+        print(f"Erreur add_trade (1er essai): {e}")
+        try:
+            conn2 = get_db(); c2 = conn2.cursor()
+            c2.execute("""INSERT INTO journal
+                (date,pair,tf,session,score,decision,bias,entry,sl,tp,rr,created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (data.get("date"), data.get("pair"), data.get("tf"), data.get("session"),
+                 data.get("score"), data.get("decision"), data.get("bias"),
+                 data.get("entry"), data.get("sl"), data.get("tp"), data.get("rr"),
+                 datetime.now().isoformat()))
+            conn2.commit()
+            tid = c2.fetchone()["id"]
+            try:
+                c2.execute("UPDATE journal SET compte_id=%s WHERE id=%s",
+                           (data.get("compte_id") or COMPTE_PROPRIETAIRE, tid))
+                conn2.commit()
+            except Exception:
+                conn2.rollback()
+            conn2.close()
+            print(f"add_trade : repli reussi, trade #{tid} enregistre en mode minimal")
+            return jsonify({"success": True, "id": tid, "mode": "repli",
+                            "avertissement": "champs etendus non enregistres — "
+                                             "verifier que le backend est a jour"})
+        except Exception as e2:
+            print(f"Erreur add_trade (repli): {e2}")
+            return jsonify({"error": str(e), "repli": str(e2)}), 500
 
 @app.route("/journal", methods=["GET"])
 def get_trades():
