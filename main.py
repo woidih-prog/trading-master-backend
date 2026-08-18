@@ -4,7 +4,7 @@ import requests
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import pytz
 import threading
 import time
@@ -1753,6 +1753,135 @@ def _verdict(a, b):
     return {"verdict": "PISTE A SURVEILLER",
             "raison": "%d points d'ecart sur %d trades minimum. Continuer a compter, "
                       "ne rien coder avant 50." % (ecart, petit)}
+
+# ══════════════════════════════════════════════════════════════
+# EVOLUTION DANS LE TEMPS (18/08/2026) — LECTURE SEULE
+#
+# Le journal n'a pas de colonne "carnet". Les 517 lignes sont dans
+# un seul tas. Mais chaque trade porte sa date : le systeme peut
+# donc se decouper tout seul, semaine par semaine.
+#
+# On y superpose les DATES DE CHANGEMENT connues, pour voir si une
+# reparation a ete suivie d'un changement de resultat.
+#
+# AVERTISSEMENT INSCRIT DANS LA REPONSE : ce tableau montre une
+# evolution, il ne prouve pas ce qui l'a causee. Le marche change
+# aussi, et il change en meme temps que le code.
+# ══════════════════════════════════════════════════════════════
+
+# Reperes connus. Ajouter ici les dates de carnet quand elles seront
+# etablies : {"date": "2026-08-01", "titre": "Debut Carnet B", "type": "carnet"}
+JALONS = [
+    {"date": "2026-06-19", "titre": "Premier trade enregistre",            "type": "systeme"},
+    {"date": "2026-07-18", "titre": "Garde-fou RSI + detecteur de regime", "type": "systeme"},
+    {"date": "2026-07-19", "titre": "POINT ZERO (etat systeme)",           "type": "systeme"},
+    {"date": "2026-08-06", "titre": "CISD passe en mode decision",         "type": "systeme"},
+    {"date": "2026-08-10", "titre": "CISD remis en observation",           "type": "systeme"},
+    {"date": "2026-08-11", "titre": "STOP ADAPTATIF (ATR) — correctif or", "type": "correctif"},
+    {"date": "2026-08-12", "titre": "Montant en base + compteur sommets",  "type": "correctif"},
+    {"date": "2026-08-12", "titre": "Ligne RR REEL (observation)",         "type": "mesure"},
+    {"date": "2026-08-15", "titre": "EA v5.20 + un seul graphique",        "type": "correctif"},
+    {"date": "2026-08-16", "titre": "Identite + compteurs automatiques",   "type": "mesure"},
+]
+
+def _ajouter_jours(iso, n):
+    try:
+        return (datetime.strptime(iso[:10], "%Y-%m-%d") + timedelta(days=n)).strftime("%Y-%m-%d")
+    except Exception:
+        return "9999-99-99"
+
+def _semaine_de(iso):
+    """Renvoie (cle_semaine, lundi) a partir d'une date ISO."""
+    try:
+        d = datetime.fromisoformat(str(iso)[:19])
+    except Exception:
+        try:    d = datetime.strptime(str(iso)[:10], "%Y-%m-%d")
+        except Exception: return None, None
+    lundi = d - timedelta(days=d.weekday())
+    return lundi.strftime("%Y-%m-%d"), lundi
+
+@app.route("/evolution", methods=["GET"])
+def evolution():
+    """Decoupe le journal dans le temps. Filtres : ?pas=semaine|jour|mois
+    ?du=AAAA-MM-JJ ?au=AAAA-MM-JJ ?compte_id=XXX"""
+    try:
+        conn = get_db(); c = conn.cursor()
+        sql = ("SELECT created_at, date, resultat, pnl, score, trap, systeme_suivi, "
+               "session, pair FROM journal WHERE resultat IN ('win','loss','be')")
+        params = []
+        if request.args.get("compte_id"):
+            sql += " AND compte_id = %s"; params.append(request.args.get("compte_id"))
+        if request.args.get("du"):
+            sql += " AND created_at >= %s"; params.append(request.args.get("du"))
+        if request.args.get("au"):
+            sql += " AND created_at <= %s"; params.append(request.args.get("au") + " 23:59:59")
+        sql += " ORDER BY created_at ASC"
+        c.execute(sql, tuple(params))
+        trades = [dict(r) for r in c.fetchall()]
+        conn.close()
+
+        if not trades:
+            return jsonify({"periodes": [], "message": "aucun trade a decouper"})
+
+        pas = (request.args.get("pas") or "semaine").lower()
+        paquets = {}
+        for t in trades:
+            src = t.get("created_at") or t.get("date")
+            cle, lundi = _semaine_de(src)
+            if cle is None:
+                continue
+            if pas == "jour":
+                cle = str(src)[:10]
+            elif pas == "mois":
+                cle = str(src)[:7]
+            paquets.setdefault(cle, []).append(t)
+
+        cumul = 0.0
+        cumul_n = 0
+        cumul_g = 0
+        periodes = []
+        for cle in sorted(paquets.keys()):
+            lot = paquets[cle]
+            g = sum(1 for t in lot if t.get("resultat") == "win")
+            p = sum(1 for t in lot if t.get("resultat") == "loss")
+            b = sum(1 for t in lot if t.get("resultat") == "be")
+            nn = g + p + b
+            montants = [float(t["pnl"]) for t in lot if t.get("pnl") is not None]
+            pnl = round(sum(montants), 2) if montants else None
+            if pnl is not None:
+                cumul += pnl
+            cumul_n += nn; cumul_g += g
+            # jalons tombant dans cette periode
+            marques = [j["titre"] for j in JALONS
+                       if (cle[:10] <= j["date"] <= (cle[:10] if pas == "jour" else "9999")) and
+                          (j["date"][:len(cle)] == cle if pas == "mois" else
+                           (cle <= j["date"] < _ajouter_jours(cle, 7) if pas == "semaine" else j["date"] == cle))]
+            periodes.append({
+                "periode": cle,
+                "n": nn, "gains": g, "pertes": p, "be": b,
+                "taux": round(100.0 * g / nn) if nn else None,
+                "pnl": pnl,
+                "pnl_connu_sur": len(montants),
+                "cumul_pnl": round(cumul, 2),
+                "taux_cumule": round(100.0 * cumul_g / cumul_n) if cumul_n else None,
+                "fragilite_points": round(abs(100.0*g/nn - 100.0*max(g-1,0)/max(nn-1,1))) if nn > 1 else None,
+                "jalons": marques
+            })
+
+        return jsonify({
+            "pas": pas,
+            "total_trades": len(trades),
+            "periodes": periodes,
+            "jalons_connus": JALONS,
+            "avertissement": ("Ce tableau montre une EVOLUTION, il ne prouve pas ce qui l'a "
+                              "causee. Le marche change aussi, en meme temps que le code. "
+                              "Les 517 lignes melangent plusieurs comptes demo, deux courtiers "
+                              "et une dizaine de versions du systeme."),
+            "note_pnl": "Le montant n'est enregistre que depuis le 12/08. Avant, pnl est vide."
+        })
+    except Exception as e:
+        print(f"evolution: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/compteurs", methods=["GET"])
 def compteurs():
